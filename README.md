@@ -62,6 +62,39 @@ de todos los modelos o herramientas.
   perfil y Total con advertencia. No se guardan aprobaciones permanentes;
   cada nueva conexión vuelve a Manual y se respetan los rechazos nativos.
 
+## Orquestador opcional
+
+La instalación normal usa el asistente básico. Para añadir el sistema de
+[Mi-agente-agent-system](https://github.com/Cassers/Mi-agente-agent-system):
+
+```bash
+pnpm run harness:install
+```
+
+Requiere Git e Internet. Descarga una **revisión fija**, incorpora protocolo,
+plantilla de agentes y skills, y registra **arquitecto-skills** como subagente
+nativo de OpenCode. No sustituye tu nombre, estilo, memorias o credenciales ni
+ejecuta instaladores del repositorio de origen. Reinicia `pnpm start` para cargarlo.
+
+```bash
+pnpm run harness:install -- --status
+pnpm run harness:install -- --disable
+```
+
+Desactivar conserva los documentos y memorias; no vuelve a activarse al arrancar
+normalmente. Repetir la instalación activa no sobrescribe tus personalizaciones.
+Los conflictos con archivos/agentes existentes se informan para resolverlos a
+mano. El módulo no se actualiza automáticamente con cada cambio del upstream.
+
+Build sigue atendiendo la conversación y delega trabajos pertinentes, no saludos
+ni la primera configuración. Los agentes heredan el modelo elegido, sin fallback
+de pago. Las delegaciones pueden aumentar tiempo/tokens y dependen del soporte
+de herramientas del proveedor, incluso en modelos gratuitos. Sus permisos se
+muestran en el mismo chat, manteniendo la confirmación nativa.
+
+Más detalles, límites y cómo registrar otros agentes en
+[la guía del orquestador](docs/optional-harness.md).
+
 ## Activar pantalla e historial
 
 Ambos vienen **apagados por privacidad**. Copia `.env.example` a `.env.local` y

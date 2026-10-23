@@ -17,6 +17,7 @@
     "preview": "vite preview",
     "bridge": "node bridge/opencode-bridge.mjs",
     "setup": "node scripts/setup.mjs",
+    "harness:install": "node scripts/harness.mjs",
     "opencode": "node scripts/opencode.mjs",
     "test": "node scripts/setup.mjs && node --test bridge/*.test.mjs scripts/*.test.mjs",
     "audit:publication": "node scripts/audit-publication.mjs"
