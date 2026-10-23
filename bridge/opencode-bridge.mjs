@@ -32,6 +32,7 @@ import { sessionMedia } from './session-media.mjs'
 import { clearPreviousMedia } from './visual-context.mjs'
 import { HISTORY_ROOT } from './history-store.mjs'
 import { readProfile } from './profile.mjs'
+import { sessionEvents } from './session-events.mjs'
 
 const PORT = Number(process.env.JARVIS_BRIDGE_PORT ?? 8787)
 const OC = (process.env.OPENCODE_URL ?? 'http://127.0.0.1:4097').replace(/\/+$/, '')
@@ -96,6 +97,10 @@ function toolName(tool) {
 
 // --- event fan-out: one SSE stream, routed by session --------------------------
 const handlers = new Map() // sessionID -> (event) => void
+const dispatchEvent = sessionEvents({ handlers, workspace: WORKSPACE,
+  getSession: id => oc('GET', `/session/${encodeURIComponent(id)}`),
+  onError: () => console.error('[opencode] No se pudo verificar el propietario de un permiso de subagente.'),
+})
 
 async function pumpEvents() {
   for (;;) {
@@ -105,7 +110,7 @@ async function pumpEvents() {
       console.log('[jarvis-oc] event stream connected')
       // Recover pending confirmations if the SSE transport was interrupted.
       void oc('GET', '/permission').then((requests) => {
-        for (const request of requests) handlers.get(request.sessionID)?.({ type: 'permission.asked', properties: request })
+        for (const request of requests) void dispatchEvent({ type: 'permission.asked', properties: request })
       }).catch(() => {})
       const reader = res.body.getReader()
       const dec = new TextDecoder()
@@ -126,10 +131,7 @@ async function pumpEvents() {
           } catch {
             continue
           }
-          const p = ev.properties ?? {}
-          const sid = p.sessionID ?? p.part?.sessionID ?? p.info?.sessionID
-          const h = sid && handlers.get(sid)
-          if (h) h(ev)
+          void dispatchEvent(ev)
         }
       }
     } catch (err) {
