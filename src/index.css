@@ -2024,7 +2024,7 @@ kbd {
 }
 .log .log-line { align-items: flex-start; flex-shrink: 0; }
 .log .log-who { flex-basis: 76px; overflow-wrap: anywhere; opacity: .85; color: #9dd3dd; }
-.log .log-text { min-width: 0; color: #edf6fa; text-shadow: none; opacity: 1; font: 15px/1.75 system-ui, sans-serif; overflow-wrap: anywhere; }
+.log .log-text { flex: 1; min-width: 0; max-width: 100%; color: #edf6fa; text-shadow: none; opacity: 1; font: 15px/1.75 system-ui, sans-serif; overflow-wrap: anywhere; }
 .log .log-user .log-text { color: #a8ccd6; }
 .response-text > :first-child { margin-top: 0; }
 .response-text > :last-child { margin-bottom: 0; }
@@ -2038,6 +2038,34 @@ kbd {
 .response-text pre code { padding: 0; background: none; }
 .response-text a { color: #87e4f0; text-decoration: underline; }
 .response-text hr { border: 0; border-top: 1px solid #44616b; margin: 1em 0; }
+.response-text { min-width: 0; max-width: 100%; }
+.response-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  margin: 1em 0;
+  border: 1px solid #466977;
+  border-radius: 10px;
+  background: #081923;
+  scrollbar-color: #78a4af #081923;
+}
+.response-table-scroll:focus-visible { outline: 2px solid #82e9e1; outline-offset: 3px; }
+.response-table-scroll table { width: 100%; border-collapse: collapse; font: inherit; line-height: 1.55; }
+.response-table-scroll th, .response-table-scroll td {
+  min-width: 150px;
+  max-width: 320px;
+  padding: 12px 14px;
+  border-right: 1px solid #304c59;
+  border-bottom: 1px solid #304c59;
+  vertical-align: top;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.response-table-scroll th { background: #173340; color: #c3f5f2; font-weight: 650; }
+.response-table-scroll td { color: #edf6fa; }
+.response-table-scroll tbody tr:nth-child(even) { background: #102630; }
+.response-table-scroll tr > :last-child { border-right: 0; }
+.response-table-scroll tbody tr:last-child td { border-bottom: 0; }
 .model-picker { margin-top: 16px; padding-top: 14px; border-top: 1px solid #38535e; text-transform: none; letter-spacing: normal; }
 .model-picker summary { cursor: pointer; color: #d9eef4; font-size: 13px; }
 .model-picker summary small { display: block; color: #9ebcc7; font-size: 11px; margin-top: 6px; overflow-wrap: anywhere; }
@@ -2088,5 +2116,5 @@ kbd {
   .hud-bottom { bottom: 16px; }
   .log .log-line { flex-direction: column; gap: 5px; }
   .log .log-who { flex-basis: auto; }
-  .log .log-text { font-size: 14px; }
+  .log .log-text { width: 100%; font-size: 14px; }
 }

@@ -87,6 +87,39 @@ test('responses render paragraphs, headings, lists, emphasis and code without ex
   assert.match(html, /&lt;script&gt;malicioso/)
   assert.doesNotThrow(() => render(Response, { text: '- \n1. \n```' }))
 })
+test('Markdown tables render real columns, formatting and accessible horizontal scrolling', () => {
+  const html = render(Response, { text: 'Resumen\n| Pregunta | Cavalry | Flier |\n| :--- | :---: | ---: |\n| Enemy raids | **Retreat** | *Counterattack* |\n| Life | Charity | Glory |\n\nDespués.' })
+  for (const pattern of [/role="region"/, /aria-label="Tabla de la respuesta"/, /tabindex="0"/,
+    /<table>/, /<thead>/, /<th scope="col" style="text-align:left">Pregunta/,
+    /text-align:center/, /text-align:right/, /<strong>Retreat<\/strong>/, /<em>Counterattack<\/em>/,
+    /<p>Resumen<\/p>/, /<p>Después\.<\/p>/]) assert.match(html, pattern)
+  assert.equal((html.match(/<th scope=/g) || []).length, 3)
+  assert.equal((html.match(/<td /g) || []).length, 6)
+  assert.doesNotMatch(html, /\||:---/)
+})
+
+test('table parsing handles optional borders, escaped and code pipes, and incomplete streamed rows', () => {
+  const html = render(Response, { text: 'A | B | C\n--- | --- | ---\nuno \\| dos | `x|y` | tres\nparcial | dato' })
+  assert.match(html, /uno \| dos/)
+  assert.match(html, /<code>x\|y<\/code>/)
+  assert.equal((html.match(/<td /g) || []).length, 6)
+  assert.match(html, /<td style="text-align:left"><\/td>/)
+  for (const text of ['A | B\n--- | todavía', 'A | B\n---', 'A | B\n--- | --- | ---', 'a | b']) {
+    assert.doesNotMatch(render(Response, { text }), /<table>/)
+  }
+  const overfull = render(Response, { text: 'A | B\n--- | ---\n1 | 2 | NO PERDER' })
+  assert.match(overfull, /NO PERDER/)
+})
+
+test('tables escape untrusted content; fenced tables remain code; prose after a table is preserved', () => {
+  const html = render(Response, { text: '| A | B |\n| --- | --- |\n| <img src=x onerror=alert(1)> | [malo](javascript:alert(1)) |\nFinal.\n\n```\nA | B\n--- | ---\n1 | 2\n```' })
+  assert.match(html, /&lt;img/)
+  assert.doesNotMatch(html, /<img|href="javascript:/)
+  assert.match(html, /<p>Final\.<\/p>/)
+  assert.match(html, /<pre><code>A \| B/)
+  assert.equal((html.match(/<table>/g) || []).length, 1)
+})
+
 test('model picker exposes only declared thinking variants and warns for text-only models', () => {
   const models = [{ id: 'free', name: 'Modelo gratuito', image: false, audio: false, variants: ['low', 'high'] }]
   const html = render(Picker, { models, model: 'free', variant: 'low', loading: false, error: '', locked: false, onChoose() {}, onRefresh() {} })
