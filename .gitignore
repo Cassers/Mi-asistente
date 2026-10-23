@@ -1,0 +1,22 @@
+# No subir configuración, perfil, sesiones, credenciales ni audio personal.
+.env
+.env.*
+!.env.example
+*.local
+opencode/
+recordings/
+logs/
+*.log
+node_modules/
+dist/
+dist-ssr/
+*.tsbuildinfo
+public/mediapipe/
+.idea/
+.vscode/
+.DS_Store
+*.part
+*.pem
+*.key
+auth.json
+cookie

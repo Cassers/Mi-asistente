@@ -1,0 +1,11 @@
+{
+  "configured": false,
+  "name": "",
+  "userName": "",
+  "address": "",
+  "style": "Claro y directo",
+  "wakeWord": "",
+  "speechRate": 1.2,
+  "language": "es-CO",
+  "timeZone": "America/Bogota"
+}
