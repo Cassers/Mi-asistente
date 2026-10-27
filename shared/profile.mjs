@@ -23,6 +23,7 @@ export const wakeWord = profile => profile.wakeWord || profile.name || 'asistent
 /** Literal names, including accents/spaces; no regular-expression injection. */
 export function wakePattern(profile, kind = 'any') {
   const name = wakeWord(profile).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  if (kind === 'greeting') return new RegExp(`^\\s*[¡¿]?\\s*hola[\\s,.:;!?-]+${name}(?![\\p{L}\\p{N}_])`, 'iu')
   const prefix = '(?:(?:hey|hi|ok|okay|oye|ey|hola)[\\s,.:;!?-]+)?'
   const phrase = `${prefix}${name}(?![\\p{L}\\p{N}_])`
   return new RegExp(kind === 'bare' ? `^${phrase}[\\s,.!?]*$`

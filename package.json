@@ -2,7 +2,7 @@
   "name": "mi-asistente",
   "private": true,
   "version": "0.0.0",
-  "description": "Asistente personal configurable con voz, pantalla e historial local, conectado a OpenCode.",
+  "description": "Asistente personal configurable con voz, pantalla e historial local, conectado a Codex y OpenCode.",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -10,17 +10,19 @@
     "pnpm": ">=11"
   },
   "scripts": {
-    "start": "node scripts/start.mjs",
+    "start": "node scripts/start-project.mjs",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "bridge": "node bridge/opencode-bridge.mjs",
+    "bridge": "node bridge/project-bridge.mjs",
     "setup": "node scripts/setup.mjs",
     "harness:install": "node scripts/harness.mjs",
     "opencode": "node scripts/opencode.mjs",
-    "test": "node scripts/setup.mjs && node --test bridge/*.test.mjs scripts/*.test.mjs",
-    "audit:publication": "node scripts/audit-publication.mjs"
+    "test": "node scripts/setup.mjs && node --test --test-concurrency=2 bridge/*.test.mjs scripts/*.test.mjs",
+    "audit:publication": "node scripts/audit-publication.mjs",
+    "start:legacy": "node scripts/start.mjs",
+    "bridge:legacy": "node bridge/opencode-bridge.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.220",

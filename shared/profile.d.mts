@@ -6,4 +6,4 @@ export const DEFAULT_PROFILE: Readonly<Profile>;
 export function normalizeProfile(raw: unknown): Profile;
 export function displayName(profile: Profile): string;
 export function wakeWord(profile: Profile): string;
-export function wakePattern(profile: Profile, kind?: 'any' | 'bare' | 'leading'): RegExp;
+export function wakePattern(profile: Profile, kind?: 'any' | 'bare' | 'leading' | 'greeting'): RegExp;

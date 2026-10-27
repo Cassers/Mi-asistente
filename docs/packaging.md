@@ -2,31 +2,41 @@
 
 ## Requisitos
 
-1. Un clon nuevo permite instalar y levantar OpenCode, bridge e interfaz con pnpm.
+1. Un clon nuevo instala con pnpm y arranca el cliente nativo Codex/OpenCode,
+   bridge e interfaz con pnpm start.
 2. El clon no contiene identidad, credenciales, chats, grabaciones ni backups ajenos.
-3. El primer chat elige nombre/estilo y los siguientes pueden retomarse.
-4. Repetir setup conserva los datos; al cerrar solo se detienen procesos propios.
-5. Captura e historial se activan por elección; no se prometen conectores ausentes.
+3. La carpeta elegida conserva sus instrucciones, modelos y conversaciones nativas.
+4. Setup y el instalador opcional conservan el workspace aislado de compatibilidad.
+5. Captura e historial se activan por elección; no se prometen modalidades ausentes.
+6. Al cerrar solo se detienen procesos propios; un servidor externo sigue activo.
 
 ## Diseño
 
-Código y plantillas versionados; datos runtime en opencode/ y recordings/,
-ignorados por Git. Setup copia solo archivos inexistentes y genera ruta MCP
-absoluta para cada clon. OpenCode usa configuración/datos/estado/caché aislados.
-Arranque con puertos estrictos, contraseña efímera y procesos hijos propios.
-Sin actualización de dependencias ni cambio del modelo seleccionado al empaquetar.
+Código y plantillas versionados. El lanzador nativo es Node, conserva las ubicaciones
+de cuenta/configuración global y abre el proyecto real mediante su cliente nativo.
+El plugin de audio de OpenCode se agrega solo al servidor propio en ejecución.
+La cuenta, los permisos, los modelos y el historial de Codex se resuelven por su CLI.
+No hay actualización de dependencias ni fallback de pago al empaquetar.
+
+El lanzador anterior y sus datos permanecen como modo legacy. Setup crea solo
+archivos inexistentes en opencode/, incluyendo la ruta MCP absoluta para ese clon;
+no aplica esas carpetas XDG aisladas al cliente nativo. El orquestador opcional se
+instala únicamente allí. Las plantillas genéricas siguen anónimas.
 
 ## Entrega y verificación
 
-- Copia de fuentes/assets por allowlist; licencia y atribución conservadas.
-- Plantillas genéricas, inicializador, launcher y pruebas de aislamiento.
-- Regresión, build, instalación frozen-lockfile y arranque aislado sin capturas.
-- Auditoría de archivos a publicar antes del primer push público.
+- Copia por allowlist con hashes en [publication-manifest.json](publication-manifest.json).
+- Evidencia y limitaciones en [publication-preparation.md](publication-preparation.md).
+- Suite completa con concurrencia 2, build, lint y prueba nativa Codex opt-in contra
+  Responses local, sin modelo remoto ni cuentas personales.
+- Smoke real del lanzador en Linux con HOME/XDG/estado temporales y tres puertos
+  altos; salud OpenCode/bridge, página y cierre de todos los grupos propios.
+- Auditoría de todos los candidatos mediante índice temporal, conservando intacto
+  el índice real que revisará el responsable de publicación antes de commit/push.
 
-La unidad de entrega es el nuevo repo: rollback local consiste en dejar de
-ejecutar este clon. No se modifica la app original ni sus datos o remoto.
-Los cambios de voz solicitados durante el empaquetado tienen respaldo separado
-en la instalación original. Nunca se distribuye ese respaldo privado.
+La unidad de entrega son cambios sin commit en este repo; el alcance exacto está
+en el manifiesto. Revertir únicamente esa unidad a la revisión base restaura el
+paquete anterior sin modificar el origen ni eliminar runtime o datos privados.
 
 ## Recibo inicial (2026-10-23)
 

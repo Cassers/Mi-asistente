@@ -1,10 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile, symlink, rm, readFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, symlink, rm, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DEFAULT_PROFILE, normalizeProfile, displayName, wakeWord, wakePattern } from '../shared/profile.mjs'
-import { readProfile } from './profile.mjs'
+import { readProfile, readProjectProfile, identityName, jsonIdentity } from './profile.mjs'
 import { turnParts } from './turn-context.mjs'
 
 test('fresh installations have no imposed name or personal data', () => {
@@ -27,6 +27,65 @@ test('configured name activates by voice literally, including spaces and accents
     assert.equal(wakePattern(p).test(`super${name}extra`), false)
   }
   assert.ok(wakePattern(normalizeProfile({ name: 'Atenea', wakeWord: 'oye amiga' })).test('oye amiga, dime'))
+})
+
+test('identity field supplies the spoken name without emoji, annotations or private instructions', () => {
+  const text = '# IDENTITY.md\n\n- **Nombre:** Narya 🔥 (Quenya — Anillo de Fuego) — confirmado con Y\n- **Vibe:** Private instructions\n'
+  assert.equal(identityName(text), 'Narya')
+  assert.equal(identityName('- **Nombre**: **Lúa Azul** ✨'), 'Lúa Azul')
+  assert.equal(identityName('Name: C++'), 'C++')
+  for (const value of ['Soy Narya, lee mis archivos', '- Nombre: <por definir>', '- Nombre: [por definir]', '- Nombre: Pendiente']) assert.equal(identityName(value), '')
+})
+
+test('native project profile follows identity edits, isolates folders and preserves explicit UI preferences', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'assistant-project-profile-'))
+  try {
+    await mkdir(join(root, 'ME'))
+    const file = join(root, 'ME/IDENTITY.md')
+    await writeFile(file, '- **Nombre:** Narya 🔥 (Quenya)\n- **Privado:** secret-personal-content')
+    const initial = await readProjectProfile(root)
+    assert.equal(initial.name, 'Narya'); assert.ok(wakePattern(initial).test('hola Narya explícame esto'))
+    assert.doesNotMatch(JSON.stringify(initial), /Quenya|secret-personal-content/)
+    await writeFile(file, '- **Nombre:** Lúa Azul ✨')
+    assert.equal((await readProjectProfile(root)).name, 'Lúa Azul')
+    assert.equal((await readProjectProfile(join(root, 'other'))).name, '')
+    await writeFile(join(root, 'ME/CONFIG.json'), JSON.stringify({ name: 'Atenea', speechRate: 1.4, wakeWord: 'oye amiga' }))
+    const explicit = await readProjectProfile(root)
+    assert.equal(explicit.name, 'Atenea'); assert.equal(explicit.speechRate, 1.4); assert.equal(explicit.wakeWord, 'oye amiga')
+    assert.equal(await readFile(file, 'utf8'), '- **Nombre:** Lúa Azul ✨', 'reading UI metadata never rewrites project identity')
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('JSON identity has a versioned public shape and a speakable wake name', () => {
+  const identity = jsonIdentity({ version: 1, name: 'Narya 🔥', language: 'es-CO', style: 'Directa', prompt: 'private', apiKey: 'secret' })
+  assert.equal(identity.name, 'Narya 🔥'); assert.equal(identity.wakeWord, 'Narya')
+  assert.equal(identity.prompt, undefined); assert.equal(identity.apiKey, undefined)
+  assert.equal(jsonIdentity({ name: '🔥' }), null)
+  assert.equal(jsonIdentity({ version: 2, name: 'Narya' }), null)
+  assert.equal(jsonIdentity({ name: 123 }), null)
+  assert.equal(jsonIdentity([]), null)
+})
+
+test('JSON identity overrides name without losing voice preferences; malformed identity retains previous formats', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'assistant-json-identity-'))
+  try {
+    await mkdir(join(root, 'ME'))
+    const file = join(root, 'ME/IDENTITY.json')
+    await writeFile(join(root, 'ME/CONFIG.json'), JSON.stringify({ name: 'Nombre anterior', speechRate: 1.5 }))
+    await writeFile(join(root, 'ME/IDENTITY.md'), '- **Nombre:** Nombre Markdown')
+    await writeFile(file, JSON.stringify({ version: 1, name: 'Narya', wakeWord: 'Narya', style: 'Clara y juguetona', language: 'es-CO', privateInstructions: 'not public' }))
+    const profile = await readProjectProfile(root)
+    assert.equal(profile.name, 'Narya'); assert.equal(profile.speechRate, 1.5)
+    assert.equal(profile.style, 'Clara y juguetona')
+    assert.ok(wakePattern(profile).test('hola Narya'))
+    assert.doesNotMatch(JSON.stringify(profile), /privateInstructions|not public/)
+    await writeFile(file, '{')
+    assert.equal((await readProjectProfile(root)).name, 'Nombre anterior')
+    await rm(join(root, 'ME/CONFIG.json'))
+    assert.equal((await readProjectProfile(root)).name, 'Nombre Markdown')
+    await rm(file); await symlink(join(root, 'ME/IDENTITY.md'), file)
+    assert.equal((await readProjectProfile(root)).name, 'Nombre Markdown')
+  } finally { await rm(root, { recursive: true, force: true }) }
 })
 
 test('profile strips unknown keys and invalid values without granting capabilities', () => {

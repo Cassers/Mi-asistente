@@ -19,6 +19,7 @@ export function transcript(messages) {
   return messages.flatMap(({ info, parts }) => {
     if (!['user', 'assistant'].includes(info.role)) return []
     const text = parts.filter((p) => p.type === 'text' && !p.synthetic && !p.ignored).map((p) => p.text).join('\n').trim()
-    return text ? [{ id: info.id, role: info.role === 'user' ? 'user' : 'jarvis', text }] : []
+    const audio = info.role === 'user' && parts.some(p => p.type === 'file' && p.mime?.startsWith('audio/') || p.type === 'text' && p.metadata?.miAsistenteAudio)
+    return text || audio ? [{ id: info.id, role: info.role === 'user' ? 'user' : 'jarvis', text: text || '🎤 Audio enviado' }] : []
   }).slice(-80)
 }

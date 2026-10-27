@@ -2,11 +2,13 @@ import type { ReactNode } from 'react'
 type Entry = { id: string; title: string; busy: boolean }
 type Props = {
   children?: ReactNode;
+  observeBusy?: boolean; deleteLocked?: boolean; removeLabel?: string;
+  onStop?: () => void;
   id: string; entries: Entry[]; locked: boolean; status: string; error: string;
   onChoose: (id: string) => void; onRefresh: () => void; onDelete: () => void;
 }
 
-export function ConversationCard({ id, entries, locked, status, error, onChoose, onRefresh, onDelete, children }: Props) {
+export function ConversationCard({ id, entries, locked, status, error, onChoose, onRefresh, onDelete, onStop, children, observeBusy = false, deleteLocked = false, removeLabel = 'Eliminar' }: Props) {
   return (
     <section className="conversation-card" aria-label="Conversaciones guardadas" aria-busy={locked}
       onKeyDown={(e) => e.stopPropagation()}>
@@ -22,7 +24,7 @@ export function ConversationCard({ id, entries, locked, status, error, onChoose,
         <select id="saved-conversation" aria-label="Elegir conversación" value={id}
           disabled={locked || !id} onFocus={onRefresh} onChange={(e) => onChoose(e.target.value)}>
           {!id && <option value="">Sin conexión</option>}
-          {entries.map(entry => <option key={entry.id} value={entry.id} disabled={entry.busy && entry.id !== id}>
+          {entries.map(entry => <option key={entry.id} value={entry.id} disabled={!observeBusy && entry.busy && entry.id !== id}>
             {entry.title} · {entry.id.slice(-4)}
           </option>)}
         </select>
@@ -33,11 +35,12 @@ export function ConversationCard({ id, entries, locked, status, error, onChoose,
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg>
           Nuevo chat
         </button>
-        <button type="button" className="surface-button surface-button--danger" disabled={locked || !id} onClick={onDelete}>
+        <button type="button" className="surface-button surface-button--danger" disabled={locked || deleteLocked || !id} onClick={onDelete}>
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 5h12M8 5V3h4v2M6 5l1 12h6l1-12M9 8v6M11 8v6" /></svg>
-          Eliminar
+          {removeLabel}
         </button>
       </div>
+      {onStop && <button type="button" className="surface-button" disabled={locked} onClick={onStop}>Detener respuesta</button>}
       <div className="conversation-card__status" role="status">
         <span className="surface-status-dot" data-busy={locked} data-error={Boolean(error)} />
         {status}

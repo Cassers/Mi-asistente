@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useSyncExternalStore } from 'react'
 import { Scene } from './scene/Scene'
 import { Hud } from './ui/Hud'
 import { Ignition } from './ui/Ignition'
@@ -6,7 +6,9 @@ import { Diagnostics } from './ui/Diagnostics'
 import { PermissionPrompt } from './ui/PermissionPrompt'
 import { ConversationsPanel } from './ui/ConversationsPanel'
 import { useStore } from './store'
-import { startVoice, type Voice, type VoiceMode } from './lib/voice'
+import { type VoiceMode } from './lib/voice'
+import { createMicrophone } from './lib/microphone'
+import { currentVoiceInputMode } from './lib/voice-input-mode'
 import { createSpeaker, cycleVoice, currentVoiceName } from './lib/tts'
 import * as sfx from './lib/sfx'
 import * as music from './lib/music'
@@ -22,6 +24,7 @@ import {
   interrupt,
   watchServers,
   watchRecording,
+  setRecordingActive,
   watchPermissions,
   watchPanels,
   watchBlades,
@@ -32,11 +35,15 @@ import {
   usingBridge,
   type Msg,
 } from './lib/brain'
-import { startAnalyser, micLevel } from './lib/audio'
+import { setMicBlocked, micLevel } from './lib/audio'
+import { markUtteranceAudio, armUtteranceAudio, takeUtteranceAudio, captureDiagnostics, resetUtteranceAudio, type VoiceClip } from './lib/utterance-audio'
 import { probeCapabilities } from './lib/capabilities'
 import { env } from './config'
 import { currentProfile, useProfile, refreshProfile, watchProfile, displayName, wakePattern } from './lib/profile'
 import { listeningMode } from './lib/listening-policy'
+import { selectedProject, projectMode, useProjects } from './lib/projects'
+import { conversationSnapshot, conversationRevision, subscribeConversation } from './lib/bridge'
+import { timingSpan, timingTrace, timingMark, timingCapture, type TimingSpan } from './lib/voice-timing'
 
 /**
  * The conversation.
@@ -70,24 +77,47 @@ const newId = () =>
  *  that woke him as "travis" gets that word sent on to the model as a question. */
 
 export default function App() {
+  const projects = useProjects()
+  const conversation = useSyncExternalStore(subscribeConversation, conversationSnapshot)
   const profile = useProfile()
   useEffect(() => watchProfile(), [])
   useEffect(() => { document.title = displayName(profile) }, [profile])
   const store = useStore
   const phase = useStore((s) => s.phase)
+  const microphoneMuted = useStore((s) => s.microphoneMuted)
   const history = useRef<Msg[]>([])
   const speaker = useRef<ReturnType<typeof createSpeaker> | null>(null)
-  const voice = useRef<Voice | null>(null)
+  const voice = useRef<ReturnType<typeof createMicrophone> | null>(null)
 
   /**
    * Monotonic turn counter. Every await in a turn checks it on the way out:
    * if it has moved, that turn was superseded by a barge-in and must not touch
    * the phase, the speaker, or the busy state on its way to the floor.
    */
+  const activeTurnTiming = useRef<TimingSpan | null>(null)
+  const followup = useRef(false)
   const turn = useRef(0)
   const booting = useRef(false)
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const voicePoll = useRef<ReturnType<typeof setInterval> | null>(null)
+  const lastProject = useRef<string | null>(null)
+  useEffect(() => {
+    const id = `${projects.selected?.id || ''}:${conversation.chat?.id || ''}`
+    if (lastProject.current === id) return
+    if (lastProject.current !== null) {
+      followup.current = false
+      turn.current++
+      speaker.current?.cancel(); speaker.current = null
+      activeTurnTiming.current?.end('cancelled')
+      activeTurnTiming.current = null
+      voice.current?.reset?.()
+      history.current = []
+      if (idleTimer.current) clearTimeout(idleTimer.current)
+      if (!['offline','boot'].includes(store.getState().phase)) store.getState().setPhase('dormant')
+    }
+    lastProject.current = id
+    void refreshProfile().catch(() => {})
+  }, [projects.selected?.id, conversation.chat?.id, store])
 
   // -- helpers --------------------------------------------------------------
 
@@ -99,9 +129,13 @@ export default function App() {
   const silence = () => {
     speaker.current?.cancel()
     speaker.current = null
+    activeTurnTiming.current?.end('cancelled')
+    activeTurnTiming.current = null
   }
 
   const goDormant = () => {
+    followup.current = false
+    resetUtteranceAudio()
     clearIdle()
     silence()
     turn.current++
@@ -118,11 +152,71 @@ export default function App() {
   /** Stop this turn, but keep wake-name recognition available. */
   const pauseConversation = () => {
     const s = store.getState()
-    if (s.phase === 'offline' || s.phase === 'boot') return
+    if (s.phase === 'offline' || s.phase === 'boot') {
+      if (s.phase === 'offline' && selectedProject()) interrupt()
+      return
+    }
     s.setConversationPaused(true)
     voice.current?.reset?.()
     interrupt()
     goDormant()
+  }
+
+  const pauseHistoryForPrivacy = () => {
+    void setRecordingActive(false).catch(() => store.getState().setError(
+      'No se pudo confirmar la pausa del historial. Comprueba la conexión.',
+    ))
+  }
+
+  const toggleMicrophone = async () => {
+    const s = store.getState()
+    if (s.microphoneBusy || s.phase === 'boot') return
+    if (s.microphoneActive && !s.microphoneMuted) {
+      s.setMicrophoneStandby(false)
+      s.setMicrophoneMuted(true)
+      s.setMicrophoneActive(false)
+      followup.current = false
+      voice.current?.stop()
+      setMicBlocked(true)
+      // Input and output are independent: let the current answer finish.
+      clearIdle()
+      s.setCaption('')
+      s.setLevel(0)
+      pauseHistoryForPrivacy()
+      return
+    }
+    s.setMicrophoneBusy(true)
+    s.setError(null)
+    s.setMicrophoneMuted(false)
+    try {
+      if (s.phase === 'offline') { await powerOn(); return }
+      if (await startCapture()) {
+        const current = store.getState()
+        current.setMicrophoneStandby(false)
+        current.setConversationPaused(false)
+        if (current.phase !== 'thinking' && current.phase !== 'tooling' && current.phase !== 'speaking') {
+          listen(AWAIT_SPEECH_MS)
+        }
+      } else {
+        s.setMicrophoneMuted(true)
+      }
+    } finally { s.setMicrophoneBusy(false) }
+  }
+
+  const toggleStandby = () => {
+    const state = store.getState()
+    if (!state.microphoneActive || state.microphoneMuted || state.microphoneBusy || state.phase === 'offline' || state.phase === 'boot') return
+    const standby = !state.microphoneStandby
+    state.setMicrophoneStandby(standby)
+    followup.current = false
+    clearIdle()
+    voice.current?.reset?.()
+    state.setCaption('')
+    if (standby) pauseHistoryForPrivacy()
+    else {
+      state.setConversationPaused(false)
+      if (!['thinking', 'tooling', 'speaking'].includes(state.phase)) listen(AWAIT_SPEECH_MS)
+    }
   }
 
   /** `window` is how long before he gives up. */
@@ -131,13 +225,35 @@ export default function App() {
     const s = store.getState()
     s.setCaption('')
     s.setPhase('listening')
+    // Direct VAD owns the segment boundary, including audio before a fast wake
+    // partial. Re-arming here could cut those first phonemes off.
+    if (currentVoiceInputMode() !== 'direct') armUtteranceAudio()
     sfx.play('listen')
     idleTimer.current = setTimeout(goDormant, window)
   }
 
   // -- one turn -------------------------------------------------------------
 
-  const respond = async (said: string): Promise<void> => {
+  const respond = async (said: string, clip?: VoiceClip, traceId: string | undefined = timingTrace(), inputKind: 'voice' | 'text' = 'voice', acknowledge?: (accepted: boolean) => void): Promise<void> => {
+    if (inputKind === 'voice' && !clip) clip = takeUtteranceAudio()
+    const directAudio = !!clip && currentVoiceInputMode() === 'direct'
+    if (inputKind === 'voice') {
+      const captured = captureDiagnostics()
+      if (captured.durationMs > 0) timingCapture(captured.durationMs, !!clip, traceId)
+    }
+    if (projectMode() && !selectedProject()) {
+      store.getState().setError('Abre un proyecto para conversar con el asistente.')
+      return
+    }
+    activeTurnTiming.current?.end('cancelled')
+    const turnTotal = timingSpan('turn.total', traceId)
+    const turnFirstAudio = timingSpan('turn.first_audio', traceId)
+    const totalTiming: TimingSpan = { end(status = 'ok') {
+      turnFirstAudio.end(status === 'ok' ? 'cancelled' : status)
+      turnTotal.end(status)
+    } }
+    activeTurnTiming.current = totalTiming
+    followup.current = false
     const mine = ++turn.current
     const stale = () => mine !== turn.current
 
@@ -145,14 +261,16 @@ export default function App() {
     const s = store.getState()
     // Last turn's panels and blades go now, before the new answer starts
     // putting its own up. Anything the model marked sticky survives.
+    s.setError(null)
     s.clearPanels()
     s.clearBlades()
     s.setCaption('')
-    s.pushTurn({ id: newId(), role: 'user', text: said })
+    if (!selectedProject()) s.pushTurn({ id: newId(), role: 'user', text: said })
     s.setPhase('thinking')
     s.setScreenCapture('off')
+    if (inputKind === 'text' || currentVoiceInputMode() === 'transcript') s.setCaption('Enviando mensaje…')
 
-    const spk = createSpeaker()
+    const spk = createSpeaker(traceId, () => turnFirstAudio.end())
     speaker.current = spk
     sfx.duck(true)
     music.duck(true)
@@ -162,7 +280,16 @@ export default function App() {
     let filled = false
 
     try {
-      const { text } = await ask(said, history.current, {
+      const { text, status: responseStatus } = await ask(said, history.current, {
+        onSubmitted: () => {
+          if (!stale()) acknowledge?.(true)
+          if (!stale() && !started) store.getState().setCaption('Mensaje recibido. Esperando respuesta…')
+        },
+        onAudio: (state, message) => {
+          if (!stale()) store.getState().setCaption(message || (directAudio
+            ? String(state) === 'attached' ? 'Audio adjunto al modelo.' : 'Preparando audio para el modelo.'
+            : state === 'interpreted' ? 'MP3 interpretado por el modelo.' : 'Se usó la transcripción del dictado.'))
+        },
         onScreen: (state) => {
           if (stale()) return
           store.getState().setScreenCapture(state)
@@ -172,16 +299,18 @@ export default function App() {
         },
         onText: (delta) => {
           if (stale()) return
+          if (delta) acknowledge?.(true)
           if (!started) {
             started = true
+            store.getState().setCaption('')
             store.getState().setPhase('speaking')
             // The answer arriving is what ends the tool phase — a timer would
             // clear the readout while a slow tool was still running.
             store.getState().setActiveTool(null)
             music.working(false)
-            store.getState().pushTurn({ id: turnId, role: 'jarvis', text: '' })
+            if (!selectedProject()) store.getState().pushTurn({ id: turnId, role: 'jarvis', text: '' })
           }
-          store.getState().appendToLastTurn(delta)
+          if (!selectedProject()) store.getState().appendToLastTurn(delta)
           spk.push(delta)
         },
         onTool: (name) => {
@@ -202,7 +331,7 @@ export default function App() {
             spk.say(forTool(name))
           }
         },
-      })
+      }, clip, traceId, inputKind === 'text' ? { audioMode: 'transcript' } : undefined)
 
       if (stale()) return
 
@@ -221,15 +350,23 @@ export default function App() {
 
       await spk.end()
       if (stale()) return
+      totalTiming.end(responseStatus === 'cancelled' ? 'cancelled' : spk.timingStatus?.() ?? 'ok')
       sfx.play('done')
     } catch (err) {
       if (stale()) return
+      // Observe the existing queue only; errors must not flush buffered prose.
+      void spk.finishTiming('error').then(() => totalTiming.end('error'))
       console.error(err)
       sfx.play('error')
       store
         .getState()
         .setError(err instanceof Error ? err.message : 'Something went wrong.')
     } finally {
+      acknowledge?.(false)
+      if (stale()) {
+        spk.cancel()
+        totalTiming.end('cancelled')
+      }
       if (!stale()) {
         speaker.current = null
         sfx.duck(false)
@@ -238,7 +375,14 @@ export default function App() {
         music.working(false)
         // Stay open. Having to say his name again to add one more sentence is
         // the difference between a conversation and a vending machine.
-        listen(FOLLOW_UP_MS)
+        const state = store.getState()
+        if (state.microphoneActive === false || state.microphoneMuted || state.microphoneStandby || state.conversationPaused) {
+          followup.current = false
+          state.setPhase('dormant')
+        } else {
+          followup.current = true
+          listen(FOLLOW_UP_MS)
+        }
       }
     }
   }
@@ -248,12 +392,38 @@ export default function App() {
   /** What the voice loop should do with what it hears, derived from phase. */
   const mode = (): VoiceMode => {
     const s = store.getState()
-    return listeningMode(s.phase, currentProfile().configured, s.conversationPaused)
+    return listeningMode(s.phase, currentProfile().configured, s.conversationPaused, s.microphoneMuted, s.microphoneStandby)
   }
 
-  const onWake = (trailing: string) => {
+  const onWake = (trailing: string, traceId?: string) => {
+    if (store.getState().microphoneMuted) return
     const phase = store.getState().phase
     if (phase === 'offline' || phase === 'boot') return
+    followup.current = false
+    if (store.getState().microphoneStandby) {
+      const state = store.getState()
+      state.setMicrophoneStandby(false)
+      state.setConversationPaused(false)
+      state.setError(null)
+      // Name-only activation changes input, never cancels/replaces playback.
+      if (!trailing) {
+        // Direct VAD keeps the whole current clip even when wake recognition lags.
+        if (currentVoiceInputMode() !== 'direct') voice.current?.reset?.()
+        if (!['thinking', 'tooling', 'speaking'].includes(phase)) listen(AWAIT_SPEECH_MS)
+        return
+      }
+      if (['thinking', 'tooling', 'speaking'].includes(phase)) onSpeechStart()
+    }
+    if (currentVoiceInputMode() === 'direct') {
+      store.getState().setConversationPaused(false)
+      store.getState().setError(null)
+      sfx.play('wake')
+      // The VAD owns the current/held audio. Wake text is never a question.
+      listen(AWAIT_SPEECH_MS)
+      return
+    }
+    if (trailing) markUtteranceAudio()
+    const wakeClip = trailing ? takeUtteranceAudio() : undefined
     store.getState().setConversationPaused(false)
     voice.current?.reset?.()
     store.getState().setError(null)
@@ -262,7 +432,7 @@ export default function App() {
     // "Jarvis, what's happening in AI this week" in one breath. Waiting for a
     // greeting he didn't need is the most common way an assistant wastes time.
     if (trailing) {
-      void respond(trailing)
+      void respond(trailing, wakeClip, traceId)
       return
     }
 
@@ -284,7 +454,7 @@ export default function App() {
    * immediately, whatever he was doing.
    */
   const onSpeechStart = () => {
-    if (store.getState().conversationPaused) return
+    if (store.getState().microphoneMuted || store.getState().conversationPaused || store.getState().microphoneStandby) return
     clearIdle()
     const phase = store.getState().phase
     if (phase === 'offline' || phase === 'boot' || phase === 'dormant' && currentProfile().configured) return
@@ -297,7 +467,7 @@ export default function App() {
       // Abandon the answer in flight. The turn counter moves in respond()'s
       // replacement; bumping it here covers the case where nothing replaces it.
       turn.current++
-      interrupt()
+      interrupt('speech')
       store.getState().setActiveTool(null)
       store.getState().setScreenCapture('off')
       music.working(false)
@@ -307,33 +477,115 @@ export default function App() {
     store.getState().setPhase('listening')
   }
 
-  const onUtterance = (text: string) => {
-    if (store.getState().conversationPaused) return
+  const onClip = (clip: VoiceClip, traceId?: string) => {
+    const state = store.getState()
+    if (currentVoiceInputMode() !== 'direct' || state.microphoneMuted || state.conversationPaused || state.microphoneStandby) return
+    if (state.phase === 'offline' || state.phase === 'boot' || state.phase === 'dormant' && currentProfile().configured) return
+    if (followup.current) timingMark('voice.followup', traceId)
+    void respond('Escucha el audio adjunto y responde a lo que digo.', clip, traceId)
+  }
+
+  const onUtterance = (text: string, traceId?: string) => {
+    if (currentVoiceInputMode() === 'direct') return
+    if (store.getState().microphoneMuted || store.getState().conversationPaused || store.getState().microphoneStandby) return
     const phase = store.getState().phase
     if (phase === 'offline' || phase === 'boot' || phase === 'dormant' && currentProfile().configured) return
 
     // People keep using his name as a vocative once they're already talking to
     // him. Strip it rather than sending "jarvis" to the model as a question.
     if (wakePattern(currentProfile(), 'bare').test(text)) {
+      takeUtteranceAudio()
       listen(AWAIT_SPEECH_MS)
       return
     }
     const said = text.replace(wakePattern(currentProfile(), 'leading'), '').trim()
     if (!said) {
+      takeUtteranceAudio()
       listen(AWAIT_SPEECH_MS)
       return
     }
 
-    void respond(said)
+    if (followup.current) timingMark('voice.followup', traceId)
+    void respond(said, undefined, traceId)
   }
 
   const onPartial = (text: string) => {
-    if (store.getState().conversationPaused) return
+    if (store.getState().microphoneMuted || store.getState().conversationPaused || store.getState().microphoneStandby) return
     store.getState().setCaption(text)
+  }
+
+  const sendTranscript = (): boolean => {
+    const state = store.getState()
+    if (currentVoiceInputMode() !== 'transcript' || state.microphoneMuted || state.conversationPaused || state.microphoneStandby || state.phase !== 'listening') return false
+    // Commit only the recognizer's pending words, never a status/caption string.
+    return voice.current?.commit?.() ?? false
   }
 
   const onVoiceError = (message: string) => {
     store.getState().setError(message)
+  }
+
+  const startCapture = async (): Promise<boolean> => {
+    voice.current ??= createMicrophone({
+      mode, requireGreeting: () => store.getState().microphoneStandby,
+      onWake, onSpeechStart, onPartial, onUtterance, onClip, onError: onVoiceError,
+    })
+    const active = await voice.current.start()
+    store.getState().setMicrophoneActive(active)
+    return active
+  }
+
+  const sendTextMessage = async (message: string): Promise<boolean> => {
+    const text = message.trim()
+    const state = store.getState()
+    if (!text || state.phase === 'boot') return false
+    if (projectMode() && !selectedProject()) {
+      state.setError('Abre un proyecto en Configuración para enviar mensajes.')
+      return false
+    }
+    // Unlock output inside the input gesture; connecting may take seconds.
+    void sfx.unlockAudio()
+    const revision = conversationRevision()
+    const destination = selectedProject()?.id
+    const chat = conversationSnapshot().chat?.id
+    try { await warm() }
+    catch (error) { state.setError(error instanceof Error ? error.message : 'No se pudo conectar.'); return false }
+    if (revision !== conversationRevision() || destination !== selectedProject()?.id || (chat && chat !== conversationSnapshot().chat?.id)) {
+      state.setError('La conversación cambió antes de enviar. Tu mensaje sigue en el cuadro de texto.')
+      return false
+    }
+    if (projectMode() && !conversationSnapshot().chat) {
+      state.setError('La conversación todavía se está abriendo. Espera a que cargue y vuelve a enviar; tu texto se conserva.')
+      return false
+    }
+    // Only unlock output. Typing must never open capture or change mute/standby.
+    if (['thinking', 'tooling', 'speaking'].includes(store.getState().phase)) interrupt('speech')
+    silence()
+    return new Promise<boolean>(accepted => {
+      void respond(text, undefined, timingTrace(), 'text', accepted).then(() => accepted(false), (error: unknown) => {
+        store.getState().setError(error instanceof Error ? error.message : 'No se pudo enviar el mensaje.')
+        accepted(false)
+      })
+    })
+  }
+
+  const replayResponse = (text: string) => {
+    const state = store.getState()
+    if (!text.trim() || ['boot', 'thinking', 'tooling', 'speaking'].includes(state.phase)) return
+    void sfx.unlockAudio()
+    clearIdle()
+    silence()
+    const playback = createSpeaker()
+    speaker.current = playback
+    state.setPhase('speaking')
+    playback.say(text)
+    void playback.end().catch((error: unknown) => state.setError(error instanceof Error ? error.message : 'No se pudo leer esta respuesta.')).finally(() => {
+      if (speaker.current !== playback) return
+      speaker.current = null
+      const current = store.getState()
+      if (current.microphoneActive && !current.microphoneMuted && !current.microphoneStandby && !current.conversationPaused) listen(FOLLOW_UP_MS)
+      else current.setPhase('dormant')
+    })
   }
 
   // -- power on -------------------------------------------------------------
@@ -354,6 +606,10 @@ export default function App() {
       // for the rest of the page, recoverable only by reloading. Reset it and
       // put the button back so the user can simply press it again.
       booting.current = false
+      voice.current?.stop()
+      store.getState().setMicrophoneActive(false)
+      setMicBlocked(true)
+      store.getState().setMicrophoneMuted(true)
       console.error('[jarvis] power-up failed:', err)
       store.getState().setPhase('offline')
       store
@@ -366,21 +622,13 @@ export default function App() {
     }
   }
 
-  const ignite = async () => {
-    const s = store.getState()
-
-    // Must happen inside the click handler — browsers won't start an
-    // AudioContext or speech synthesis without a user gesture.
-    await sfx.unlockAudio()
-    // Keep tool audio available without playing the opening sound or music.
-    music.enable()
-
-    // This phase only guards real initialization; there is no intro overlay.
-    s.setPhase('boot')
-    await refreshProfile()
-
+  // Data/tools are available to text chat before any microphone activation.
+  const configureClient = () => {
     watchServers((servers) => store.getState().setConnected(servers))
-    watchRecording((recording) => store.getState().setRecording(recording))
+    watchRecording((recording) => {
+      store.getState().setRecording(recording)
+      if ((store.getState().microphoneMuted || store.getState().microphoneStandby) && recording.active) pauseHistoryForPrivacy()
+    })
     watchPermissions((permissions) => store.getState().setPermissions(permissions))
     watchPanels((panel) => store.getState().pushPanel(panel))
     watchBlades((blade) => store.getState().pushBlade(blade))
@@ -479,6 +727,22 @@ export default function App() {
           .setError('Conexión restablecida; comprobando la conversación.')
       }
     })
+  }
+
+  const ignite = async () => {
+    const s = store.getState()
+
+    // Must happen inside the click handler — browsers won't start an
+    // AudioContext or speech synthesis without a user gesture.
+    await sfx.unlockAudio()
+    // Keep tool audio available without playing the opening sound or music.
+    music.enable()
+
+    // This phase only guards real initialization; there is no intro overlay.
+    s.setPhase('boot')
+    await refreshProfile()
+
+    configureClient()
     const warming = warm().catch((err: Error) => s.setError(err.message))
 
     if (!usingBridge && !env.anthropicKey) {
@@ -509,36 +773,18 @@ export default function App() {
     store.getState().setConnected(connectedLabels())
     store.getState().setVoice(currentVoiceName())
 
-    // The analyser is what makes the reactor pulse with your voice. It needs a
-    // getUserMedia stream; speech recognition does not, and gets its own. So a
-    // failure here costs the animation and nothing else — saying "voice input
-    // is unavailable" was both alarming and untrue.
-    try {
-      await startAnalyser()
-    } catch {
-      console.warn(
-        '[jarvis] no microphone stream — the reactor will not pulse with your ' +
-          'voice. Speech recognition is unaffected.',
-      )
-    }
-
     // Ask the bridge which speech engines exist before the loop starts, so the
     // first turn already uses ElevenLabs when a key is present and the browser
     // fallback when it is not — no flag, no reload.
     await probeCapabilities()
 
-    // One voice loop, started once, running until the page closes.
-    voice.current = await startVoice({
-      mode,
-      onWake,
-      onSpeechStart,
-      onPartial,
-      onUtterance,
-      onError: onVoiceError,
-    })
+    // One capture owner, explicitly stopped and recreated by the microphone button.
+    if (!store.getState().microphoneMuted && !await startCapture()) {
+      store.getState().setMicrophoneMuted(true)
+    }
 
     store.getState().setPhase('dormant')
-    if (!currentProfile().configured) {
+    if (!currentProfile().configured && !store.getState().microphoneMuted) {
       const welcome = 'Antes de empezar, ¿cómo quieres llamarme y qué estilo de respuesta prefieres?'
       store.getState().pushTurn({ id: newId(), role: 'jarvis', text: welcome })
       const setup = createSpeaker()
@@ -548,6 +794,16 @@ export default function App() {
       listen(60000)
     }
   }
+
+  useEffect(() => {
+    if (!usingBridge || !projects.available) return
+    configureClient()
+    // Opening a project establishes its native chat without opening capture.
+    void warm().catch((error: Error) => store.getState().setError(error.message))
+    void probeCapabilities().catch(() => {})
+    // Handlers read current stores/refs; registering again replaces subscriptions.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projects.available])
 
   // -- clap to start --------------------------------------------------------
 
@@ -564,7 +820,10 @@ export default function App() {
    * about a feature nobody asked for would be worse than quietly doing without.
    */
   useEffect(() => {
+    if (projectMode()) return // capture starts only after an explicit user activation
+    if (microphoneMuted) { setMicBlocked(true); return }
     if (phase !== 'offline') return
+    setMicBlocked(false)
     let live: { stop: () => void } | null = null
     let gone = false
     void listenForClap(() => {
@@ -578,7 +837,7 @@ export default function App() {
       live?.stop()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase])
+  }, [phase, microphoneMuted])
 
   // -- level pump + keys ----------------------------------------------------
 
@@ -601,6 +860,11 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement)?.tagName
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON' || tag === 'SELECT' || (e.target as HTMLElement)?.isContentEditable) return
+
+      if (e.key === 'Enter' && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey && sendTranscript()) {
+        e.preventDefault()
+        return
+      }
 
       // V auditions the next British voice installed on this machine. Which
       // ones exist varies per Mac, so hearing them beats trusting a ranking.
@@ -685,6 +949,9 @@ export default function App() {
       // a missed wake word doesn't cost a take.
       if (e.code !== 'Space' || e.repeat || e.metaKey || e.ctrlKey || e.altKey) return
       e.preventDefault()
+      if (store.getState().microphoneMuted) return
+      if (store.getState().microphoneActive === false) { void toggleMicrophone(); return }
+      if (store.getState().microphoneStandby) { onWake(''); return }
 
       const phase = store.getState().phase
       if (phase === 'offline') {
@@ -710,7 +977,11 @@ export default function App() {
       clearIdle()
       if (voicePoll.current) clearInterval(voicePoll.current)
       voice.current?.stop()
+      store.getState().setMicrophoneActive(false)
+      setMicBlocked(true)
       speaker.current?.cancel()
+      activeTurnTiming.current?.end('cancelled')
+      activeTurnTiming.current = null
       // Fast Refresh tears down the microphone too. Return to the activation
       // button instead of leaving a listening HUD with a stopped recognizer.
       store.getState().setPhase('offline')
@@ -724,11 +995,17 @@ export default function App() {
   return (
     <>
       <Scene />
-      <Hud onPause={pauseConversation} onResume={() => onWake('')} />
+      <Hud chatId={conversation.chat?.id} composerScope={conversationRevision()} onPause={pauseConversation} onResume={() => onWake('')} onToggleStandby={toggleStandby} onSendMessage={sendTextMessage} onReplay={replayResponse} onSubmitTranscript={() => { sendTranscript() }} onToggleMicrophone={() => {
+        if (store.getState().phase === 'offline' && !store.getState().microphoneMuted) void powerOn()
+        else void toggleMicrophone()
+      }} />
       <PermissionPrompt />
-      <ConversationsPanel />
+      <ConversationsPanel onStop={pauseConversation} />
       <Diagnostics />
-      <Ignition onStart={() => void powerOn()} />
+      <Ignition client={projects.available} onStart={() => {
+        if (projectMode() && store.getState().microphoneMuted) void toggleMicrophone()
+        else void powerOn()
+      }} />
     </>
   )
 }

@@ -33,9 +33,9 @@ import { useStore } from '../store'
  * mounting is not the dangerous direction; the fade-out is gone, and the boot
  * sequence takes the screen immediately anyway, so there is nothing to see.
  */
-export function Ignition({ onStart }: { onStart: () => void }) {
+export function Ignition({ onStart, client = false }: { onStart: () => void; client?: boolean }) {
   const phase = useStore((s) => s.phase)
-  if (phase !== 'offline') return null
+  if (client || phase !== 'offline') return null
 
   return (
     <button className="ignition" onClick={onStart}>
@@ -47,8 +47,8 @@ export function Ignition({ onStart }: { onStart: () => void }) {
       */}
       <span className="ignition-ring" />
       <span className="ignition-label">
-        <span className="ignition-word">INITIALISE</span>
-        <span className="ignition-sub">click, or clap, to power up</span>
+        <span className="ignition-word">{client ? 'ACTIVAR VOZ' : 'INITIALISE'}</span>
+        <span className="ignition-sub">{client ? 'El proyecto y sus chats funcionan sin activar el micrófono' : 'click, or clap, to power up'}</span>
       </span>
     </button>
   )

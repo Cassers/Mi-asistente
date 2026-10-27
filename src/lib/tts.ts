@@ -12,6 +12,7 @@ import { caps } from './capabilities'
 import { currentProfile } from './profile'
 import { currentSpeechRate } from './speech-settings'
 import { speechText, createSpeechFilter } from './speech-text'
+import { timingSpan, type TimingSpan, type TimingStatus } from './voice-timing'
 
 /**
  * Speech output.
@@ -43,6 +44,9 @@ type Speaker = {
   cancel: () => void
   /** 0..1 output loudness for the visualiser. */
   level: () => number
+  /** Observe already queued audio without flushing extra text on a failed turn. */
+  finishTiming: (status: TimingStatus) => Promise<void>
+  timingStatus: () => TimingStatus
 }
 
 // ---------------------------------------------------------------------------
@@ -293,15 +297,46 @@ type Item = {
   text: string
   /** Generation starts one sentence ahead, not all at once. */
   audio?: Promise<string | null> | null
+  measured: boolean
+  queued?: TimingSpan
 }
 
-export function createSpeaker(): Speaker {
+export function createSpeaker(traceId?: string, onFirstAudio?: () => void): Speaker {
   const filter = createSpeechFilter()
   const queue: Item[] = []
   let buffer = ''
   let cancelled = false
   let outLevel = 0
   let pumping = false
+  const spans = new Set<TimingSpan>()
+  let total: TimingSpan | undefined
+  let firstAudio: TimingSpan | undefined
+  let firstAudible = false
+  let answerPushed = false
+  let outcome: TimingStatus = 'ok'
+  const span = (name: 'tts.total' | 'tts.first_audio' | 'tts.queue' | 'tts.synthesis' | 'tts.playback', measured = true) => {
+    if (!traceId || !measured || cancelled) return undefined
+    const raw = timingSpan(name, traceId)
+    const tracked: TimingSpan = { end(status) { raw.end(status); spans.delete(tracked) } }
+    spans.add(tracked)
+    return tracked
+  }
+  const closeTimings = (status: TimingStatus) => {
+    for (const active of spans) active.end(status)
+  }
+  const audioStarted = (measured: boolean) => {
+    if (cancelled || !measured) return undefined
+    if (!firstAudible) {
+      firstAudible = true
+      try { onFirstAudio?.() } catch { /* observer only */ }
+    }
+    firstAudio?.end()
+    firstAudio = undefined
+    return span('tts.playback')
+  }
+  const failed = (status: TimingStatus) => {
+    if (!cancelled) outcome = status
+  }
 
   let currentAudio: HTMLAudioElement | null = null
   let nativeInFlight = false
@@ -320,7 +355,8 @@ export function createSpeaker(): Speaker {
     const text = speechText(sentence)
     if (!text) return
 
-    const item: Item = { text }
+    const measured = !priority
+    const item: Item = { text, measured, queued: span('tts.queue', measured) }
     if (priority) {
       // Genuinely ahead of the queue this time. The old `say()` appended to the
       // same chain and only appeared to preempt because it was called when the
@@ -333,7 +369,7 @@ export function createSpeaker(): Speaker {
   }
 
   /** null means "no audio pipeline, use the system voice directly". */
-  function synthesise(text: string): Promise<string | null> | null {
+  function synthesise(text: string, measured: boolean): Promise<string | null> | null {
     // Prefer the ElevenLabs voice whenever the bridge reports it is available —
     // for a demo the timbre is worth the round trip, and this is what makes the
     // premium path automatic with no flag to set. It falls back to the browser
@@ -345,11 +381,21 @@ export function createSpeaker(): Speaker {
       // ElevenLabs, which makes the one field naming the engine useless
       // exactly when you are trying to work out which engine is at fault.
       diag.engine = 'elevenlabs'
-      return fetchCloudAudio(text).catch(() => null)
+      const synthesis = span('tts.synthesis', measured)
+      return fetchCloudAudio(text).catch(() => null).then(url => {
+        synthesis?.end(url ? 'ok' : 'fallback')
+        if (!url && measured) failed('fallback')
+        return url
+      })
     }
     if (TTS_ENGINE === 'kokoro' && !kokoro.isUnavailable()) {
       diag.engine = 'kokoro'
-      return kokoro.speak(text).catch(() => null)
+      const synthesis = span('tts.synthesis', measured)
+      return kokoro.speak(text).catch(() => null).then(url => {
+        synthesis?.end(url ? 'ok' : 'fallback')
+        if (!url && measured) failed('fallback')
+        return url
+      })
     }
     diag.engine = 'system'
     return null
@@ -357,7 +403,7 @@ export function createSpeaker(): Speaker {
 
   /** Start generating an item's audio if it hasn't begun. */
   const prime = (item: Item | undefined) => {
-    if (item && item.audio === undefined) item.audio = synthesise(item.text)
+    if (item && item.audio === undefined) item.audio = synthesise(item.text, item.measured)
   }
 
   async function pump(): Promise<void> {
@@ -368,6 +414,7 @@ export function createSpeaker(): Speaker {
         if (cancelled) break
         const item = queue.shift()
         if (!item) break
+        item.queued?.end()
 
         prime(item)
         // Exactly one sentence ahead. Priming the whole queue fires every
@@ -391,11 +438,11 @@ export function createSpeaker(): Speaker {
       if (cancelled) return
       // A failed generation is not a failed turn — drop to the system voice.
       if (url) {
-        await playUrl(url, item.text)
+        await playUrl(url, item.text, item.measured)
         return
       }
 
-      const spoke = await speakNative(item.text)
+      const spoke = await speakNative(item.text, item.measured)
       if (spoke || cancelled) return
 
       // A failed native voice does not authorize a cloud fallback. Only use
@@ -407,19 +454,25 @@ export function createSpeaker(): Speaker {
       }
       if (!USE_ELEVENLABS && !caps().tts) return
       diag.engine = 'elevenlabs'
+      const synthesis = span('tts.synthesis', item.measured)
       const rescue = await fetchCloudAudio(item.text).catch(() => null)
+      synthesis?.end(rescue ? 'ok' : 'error')
+      if (item.measured) failed(rescue ? 'fallback' : 'error')
       if (rescue && !cancelled) {
         diag.rescued++
-        await playUrl(rescue, item.text)
+        await playUrl(rescue, item.text, item.measured)
       }
+    } catch (error) {
+      if (item.measured) { failed('error'); closeTimings('error') }
+      throw error
     } finally {
       if (speaking === item.text) setSpeaking('')
     }
   }
 
-  const speakNative = (text: string) =>
+  const speakNative = (text: string, measured: boolean) =>
     new Promise<boolean>((resolve) => {
-      if (typeof speechSynthesis === 'undefined') return resolve(false)
+      if (typeof speechSynthesis === 'undefined') { if (measured) failed('error'); return resolve(false) }
       // Chrome's speechSynthesis wedges after cancel().
       //
       // This is the single most likely reason a whole session goes silent. The
@@ -462,6 +515,9 @@ export function createSpeaker(): Speaker {
 
       let done = false
       let started = false
+      const queued = span('tts.queue', measured)
+      let playback: TimingSpan | undefined
+      let status: TimingStatus = 'ok'
       let watchdog: ReturnType<typeof setTimeout> | null = null
       let keepalive: ReturnType<typeof setInterval> | null = null
 
@@ -469,6 +525,9 @@ export function createSpeaker(): Speaker {
         if (done) return
         done = true
         nativeInFlight = false
+        queued?.end(cancelled ? 'cancelled' : status)
+        playback?.end(cancelled ? 'cancelled' : status)
+        if (status !== 'ok' && measured) failed(status)
         if (watchdog) clearTimeout(watchdog)
         if (keepalive) clearInterval(keepalive)
         cancelAnimationFrame(raf)
@@ -480,6 +539,9 @@ export function createSpeaker(): Speaker {
       }
 
       u.onstart = () => {
+        if (done || cancelled || started) return
+        queued?.end()
+        playback = audioStarted(measured)
         started = true
         diag.started++
         diag.lastError = ''
@@ -500,6 +562,7 @@ export function createSpeaker(): Speaker {
       // quiet app, which is exactly the bug that took three attempts to find.
       u.onerror = (e) => {
         const code = String((e as SpeechSynthesisErrorEvent).error ?? 'unknown')
+        status = code === 'interrupted' || code === 'canceled' ? 'cancelled' : 'error'
         diag.lastError = code
         // 'interrupted' and 'canceled' are us, cancelling deliberately on a
         // barge-in. Everything else means the engine could not speak.
@@ -522,6 +585,7 @@ export function createSpeaker(): Speaker {
         try {
           speechSynthesis.speak(u)
         } catch {
+          status = 'error'
           finish()
           return
         }
@@ -530,6 +594,7 @@ export function createSpeaker(): Speaker {
           console.error('[jarvis] speech engine is not responding')
           diag.failures++
           diag.lastError = diag.lastError || 'no-start'
+          status = 'timeout'
           finish()
         }, 1500)
       }, 700)
@@ -540,7 +605,7 @@ export function createSpeaker(): Speaker {
       speechSynthesis.speak(u)
     })
 
-  const playUrl = (url: string, text: string) =>
+  const playUrl = (url: string, text: string, measured: boolean) =>
     new Promise<void>((resolve) => {
       const audio = new Audio(url)
       audio.playbackRate = currentSpeechRate()
@@ -582,9 +647,15 @@ export function createSpeaker(): Speaker {
       tick()
 
       let done = false
+      let playback: TimingSpan | undefined
+      const queued = span('tts.queue', measured)
+      let status: TimingStatus = 'ok'
       const finish = () => {
         if (done) return
         done = true
+        queued?.end(cancelled ? 'cancelled' : status)
+        playback?.end(cancelled ? 'cancelled' : status)
+        if (status !== 'ok' && measured) failed(status)
         cancelAnimationFrame(raf)
         outLevel = 0.12
         URL.revokeObjectURL(url)
@@ -595,11 +666,15 @@ export function createSpeaker(): Speaker {
       // SpeechSynthesisUtterance.onstart, and it is what makes the diagnostics
       // verdict — and the T self-test — tell the truth on the premium path.
       audio.onplaying = () => {
+        if (done || cancelled) return
+        queued?.end()
+        playback ??= audioStarted(measured)
         diag.started++
         diag.lastError = ''
       }
       audio.onended = finish
       audio.onerror = () => {
+        status = 'error'
         // A decode or network failure on a blob we already hold is rare, but
         // silent when it happens: the sentence simply never plays and the queue
         // moves on. Count it rather than letting it look like nothing was said.
@@ -610,8 +685,9 @@ export function createSpeaker(): Speaker {
       // The one that matters for barge-in: cancel() pauses the element, and a
       // paused element never fires `ended`. Without this the promise never
       // settles and every await behind it hangs for the life of the page.
-      audio.onpause = finish
+      audio.onpause = () => { status = 'cancelled'; finish() }
       void audio.play().catch((err) => {
+        status = 'error'
         diag.failures++
         diag.lastError = String((err as Error)?.name ?? 'play-rejected')
         finish()
@@ -624,6 +700,11 @@ export function createSpeaker(): Speaker {
     },
     push(delta) {
       if (cancelled) return
+      if (delta && !answerPushed) {
+        answerPushed = true
+        total = span('tts.total')
+        firstAudio = span('tts.first_audio')
+      }
       buffer += filter.push(delta)
 
       // Drain every complete sentence sitting in the buffer.
@@ -665,11 +746,17 @@ export function createSpeaker(): Speaker {
         buffer = ''
       }
       if (cancelled) return
-      if (!pumping && !queue.length) return
-      await new Promise<void>((resolve) => drained.push(resolve))
+      if (pumping || queue.length) await new Promise<void>((resolve) => drained.push(resolve))
+      if (!cancelled) {
+        total?.end(outcome)
+        // Filtered/empty text has no observable first audio timestamp.
+        firstAudio?.end(outcome === 'ok' ? 'cancelled' : outcome)
+        closeTimings(outcome)
+      }
     },
     cancel() {
       if (cancelled) return
+      closeTimings('cancelled')
       cancelled = true
       buffer = ''
       queue.length = 0
@@ -694,6 +781,11 @@ export function createSpeaker(): Speaker {
       outLevel = 0
       settleDrained()
     },
+    async finishTiming(status) {
+      if (pumping || queue.length) await new Promise<void>(resolve => drained.push(resolve))
+      closeTimings(cancelled ? 'cancelled' : status)
+    },
+    timingStatus: () => outcome,
     level: () => outLevel,
   }
 }

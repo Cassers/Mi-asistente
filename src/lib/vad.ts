@@ -32,14 +32,25 @@ export type VadHandlers = {
   onStart: () => void
   /** Speech ended. The blob is one complete, decodable audio file. */
   onEnd: (audio: Blob, ms: number) => void
+  /** Optional observation of the existing silence window, without retuning it. */
+  onQuiet?: () => void
+  onResume?: () => void
+  onBoundary?: (reason: 'silence' | 'limit' | 'cancelled') => void
   /** 0..1 smoothed input level, for the caption/orb while capturing. */
   onLevel: (v: number) => void
   /** Capture is impossible — no microphone, or no MediaRecorder support. */
   onError: (message: string) => void
 }
 
+export type PcmVadHandlers = Omit<VadHandlers, 'onEnd'> & {
+  /** Synchronous PCM boundary: no MediaRecorder stop/data callbacks. */
+  onEnd: (audio: null, ms: number) => void
+}
+export type VadOptions = { pcmOnly?: boolean; guard?: () => boolean; maxSegmentMs?: number }
+
 export type Vad = {
   stop: () => void
+  reset?: () => void
   /** Raise the trigger bar while JARVIS speaks, so his own playback leaking
    *  past echo cancellation does not register as the user talking. */
   setGuard: (on: boolean) => void
@@ -99,7 +110,9 @@ function pickMime(): string {
   return ''
 }
 
-export async function startVad(h: VadHandlers): Promise<Vad> {
+export function startVad(h: PcmVadHandlers, options: VadOptions & { pcmOnly: true }): Promise<Vad>
+export function startVad(h: VadHandlers, options?: VadOptions & { pcmOnly?: false }): Promise<Vad>
+export async function startVad(h: VadHandlers | PcmVadHandlers, options: VadOptions = {}): Promise<Vad> {
   let stream: MediaStream
   try {
     stream = await getMic()
@@ -112,12 +125,14 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
     return { stop: () => {}, setGuard: () => {}, live: () => false, meter: () => ({ energy: 0, floor: 0, threshold: 0, speaking: false }) }
   }
 
-  if (typeof MediaRecorder === 'undefined') {
+  if (!options.pcmOnly && typeof MediaRecorder === 'undefined') {
     h.onError('This browser cannot record audio — voice input is unavailable.')
     return { stop: () => {}, setGuard: () => {}, live: () => false, meter: () => ({ energy: 0, floor: 0, threshold: 0, speaking: false }) }
   }
 
-  const mime = pickMime()
+  const maxSegmentMs = Number.isFinite(options.maxSegmentMs) && options.maxSegmentMs! > 0
+    ? Math.min(MAX_MS, options.maxSegmentMs!) : MAX_MS
+  const mime = options.pcmOnly ? '' : pickMime()
   const ctx = new AudioContext()
   // Some browsers start an AudioContext suspended even after a gesture; resume
   // is a no-op when it is already running.
@@ -142,7 +157,16 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
   let speaking = false
   let speechStartedAt = 0
   let lastLoud = 0
+  let quiet = false
   let raf = 0
+
+  const observe = (callback: (() => void) | undefined) => {
+    try { callback?.() } catch { /* Diagnostics cannot affect capture. */ }
+  }
+  const boundary = (reason: 'silence' | 'limit' | 'cancelled') => {
+    quiet = false
+    observe(() => h.onBoundary?.(reason))
+  }
 
   const rms = (): number => {
     analyser.getFloatTimeDomainData(buf)
@@ -152,6 +176,7 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
   }
 
   const startRecorder = () => {
+    if (options.pcmOnly) return
     parts = []
     try {
       recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream)
@@ -181,6 +206,10 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
     const startedAt = speechStartedAt
     speaking = false
     speechStartedAt = 0
+    if (options.pcmOnly) {
+      ;(h as PcmVadHandlers).onEnd(null, startedAt ? performance.now() - startedAt : 0)
+      return
+    }
     if (!rec) return
     recorder = null
 
@@ -189,7 +218,7 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
       const blob = new Blob(parts, { type })
       parts = []
       const ms = startedAt ? performance.now() - startedAt : 0
-      h.onEnd(blob, ms)
+      ;(h as VadHandlers).onEnd(blob, ms)
     }
     rec.onstop = finalise
     try {
@@ -215,7 +244,7 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
       floor = Math.max(floor, 0.0015)
     }
 
-    threshold = floor * TRIGGER_OVER_FLOOR * (guard ? GUARD_BOOST : 1)
+    threshold = floor * TRIGGER_OVER_FLOOR * ((options.guard?.() ?? guard) ? GUARD_BOOST : 1)
     const release = threshold * RELEASE_RATIO
     const now = performance.now()
 
@@ -232,6 +261,7 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
           speaking = true
           speechStartedAt = armedAt
           lastLoud = now
+          quiet = false
           h.onStart()
         }
       } else if (armedAt !== 0) {
@@ -240,11 +270,18 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
         discardRecorder()
       }
     } else {
-      if (smoothEnergy > release) lastLoud = now
+      if (smoothEnergy > release) {
+        lastLoud = now
+        if (quiet) { quiet = false; observe(h.onResume) }
+      } else if (!quiet) {
+        quiet = true
+        observe(h.onQuiet)
+      }
       const quietFor = now - lastLoud
       const runFor = now - speechStartedAt
-      if (quietFor >= SILENCE_MS || runFor >= MAX_MS) {
+      if (quietFor >= SILENCE_MS || runFor >= maxSegmentMs) {
         armedAt = 0
+        boundary(quietFor >= SILENCE_MS ? 'silence' : 'limit')
         endSegment()
       }
     }
@@ -253,7 +290,13 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
   tick()
 
   return {
+    reset: () => {
+      if (speaking || quiet) boundary('cancelled')
+      armedAt = 0; speaking = false; speechStartedAt = 0; lastLoud = 0
+      discardRecorder()
+    },
     stop: () => {
+      if (speaking || quiet) boundary('cancelled')
       stopped = true
       cancelAnimationFrame(raf)
       discardRecorder()

@@ -218,6 +218,14 @@ function defined<T extends object>(patch: T | undefined): Partial<T> {
 const MAX_ORBITS = 8
 
 type State = {
+  microphoneMuted: boolean
+  microphoneActive: boolean
+  setMicrophoneActive: (active: boolean) => void
+  microphoneStandby: boolean
+  setMicrophoneStandby: (standby: boolean) => void
+  microphoneBusy: boolean
+  setMicrophoneMuted: (muted: boolean) => void
+  setMicrophoneBusy: (busy: boolean) => void
   conversationPaused: boolean
   setConversationPaused: (paused: boolean) => void
   recording: { active: boolean; fps: number; error?: string; root: string } | null
@@ -286,7 +294,18 @@ type State = {
 }
 
 export const useStore = create<State>((set) => ({
+  microphoneMuted: (() => { try { return localStorage.getItem('assistant.microphoneMuted') === 'true' } catch { return false } })(),
+  microphoneBusy: false,
+  microphoneActive: false,
+  setMicrophoneActive: (microphoneActive) => set({ microphoneActive }),
+  setMicrophoneMuted: (microphoneMuted) => {
+    try { localStorage.setItem('assistant.microphoneMuted', String(microphoneMuted)) } catch { /* storage unavailable */ }
+    set({ microphoneMuted })
+  },
+  setMicrophoneBusy: (microphoneBusy) => set({ microphoneBusy }),
   conversationPaused: false,
+  microphoneStandby: false,
+  setMicrophoneStandby: (microphoneStandby) => set({ microphoneStandby }),
   setConversationPaused: (conversationPaused) => set({ conversationPaused }),
   permissions: [],
   setPermissions: (permissions) => set({ permissions }),
@@ -375,7 +394,7 @@ export const useStore = create<State>((set) => ({
   setActiveTool: (activeTool) => set({ activeTool }),
   setError: (error) => set({ error }),
   setConnected: (connected) => set({ connected }),
-  pushTurn: (turn) => set((s) => ({ turns: [...s.turns.slice(-40), turn] })),
+  pushTurn: (turn) => set((s) => ({ turns: [...s.turns, turn] })),
   appendToLastTurn: (text) =>
     set((s) => {
       const turns = [...s.turns]

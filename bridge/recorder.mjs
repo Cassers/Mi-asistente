@@ -12,27 +12,36 @@ export const TARGET_FPS = 2
 export const frameDelayMs = (elapsedMs, fps = TARGET_FPS) => Math.max(0, 1000 / fps - elapsedMs)
 
 export class Recorder {
-  constructor(root = HISTORY_ROOT) {
+  constructor(root = HISTORY_ROOT, timing = null) {
     this.root = root
+    this.timing = timing
     this.state = { active: false, root, fps: 0, targetFps: TARGET_FPS, retentionMinutes: 30, audio: ['mic', 'system'], error: '' }
     this.children = new Set()
     this.queue = Promise.resolve()
     this.maintenance = setInterval(() => {
       if (this.pruning) return
-      this.pruning = pruneHistory(this.root).catch((err) => { this.state.error = `Retención: ${err.message}` })
+      this.pruning = this.measure('history.prune', () => pruneHistory(this.root)).catch((err) => { this.state.error = `Retención: ${err.message}` })
         .finally(() => { this.pruning = null })
     }, 10000)
     this.maintenance.unref()
   }
   snapshot() { return { ...this.state, updatedAt: Date.now() } }
+  async measure(name, work) {
+    let span
+    try { span = this.timing?.start(name) } catch { /* Observer only. */ }
+    try { const value = await work(); try { span?.end() } catch {} return value }
+    catch (error) { try { span?.end(error.name === 'AbortError' ? 'cancelled' : 'error') } catch {} throw error }
+  }
   async publish() {
+    return this.measure('history.publish', async () => {
     await mkdir(this.root, { recursive: true, mode: 0o700 })
     const tmp = join(this.root, 'status.json.part')
     await writeFile(tmp, JSON.stringify(this.snapshot()), { mode: 0o600 })
     await rename(tmp, join(this.root, 'status.json'))
+    })
   }
   setActive(on) {
-    this.queue = this.queue.catch(() => {}).then(() => on ? this.start() : this.stop())
+    this.queue = this.queue.catch(() => {}).then(() => this.measure('history.toggle', () => on ? this.start() : this.stop()))
     return this.queue
   }
   async start() {
@@ -76,8 +85,10 @@ export class Recorder {
       const started = Date.now()
       const file = join(this.session, 'frames', `screen-${started}-${this.state.frames}.png`)
       try {
-        await run('grim', ['-t', 'png', '-l', '1', '-o', output, file + '.part'], { timeout: 3000, signal })
-        await rename(file + '.part', file)
+        await this.measure('history.frame', async () => {
+          await run('grim', ['-t', 'png', '-l', '1', '-o', output, file + '.part'], { timeout: 3000, signal })
+          await rename(file + '.part', file)
+        })
         this.state.frames++
         measuredFrames++
         failures = 0

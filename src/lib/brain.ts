@@ -3,10 +3,12 @@ import * as direct from './anthropic'
 import * as bridge from './bridge'
 import type { AskHandlers, Msg } from './anthropic'
 import type { Blade, Panel } from '../store'
+import type { VoiceClip } from './utterance-audio'
+import type { TimingStatus } from './timings'
 
 export type { AskHandlers, Msg }
 export type { ConnectionState } from './bridge'
-export { watchRecording, setRecordingActive, watchPermissions, replyPermission } from './bridge'
+export { watchRecording, setRecordingActive, watchPermissions, replyPermission, replyUserInput } from './bridge'
 
 /**
  * Picks the brain. Both backends answer a question and stream text and tool
@@ -29,9 +31,12 @@ export async function ask(
   prompt: string,
   history: Msg[],
   handlers: AskHandlers,
-): Promise<{ text: string; tools: string[] }> {
+  audio?: VoiceClip,
+  traceId?: string,
+  options?: { audioMode?: 'transcript' },
+): Promise<{ text: string; tools: string[]; status?: TimingStatus }> {
   return usingBridge
-    ? bridge.ask(prompt, handlers)
+    ? bridge.ask(prompt, handlers, audio, traceId, options)
     : direct.ask([...history, { role: 'user', content: prompt }], handlers)
 }
 
@@ -97,8 +102,9 @@ export function cancel(): void {
 }
 
 /** The older name for `cancel()`. */
-export function interrupt(): void {
-  cancel()
+export function interrupt(reason: 'speech' | 'manual' = 'manual'): void {
+  if (usingBridge) bridge.interrupt(reason)
+  else direct.cancel()
 }
 
 /**

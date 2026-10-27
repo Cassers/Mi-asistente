@@ -2,7 +2,9 @@
 
 ## Uso
 
-Ejecuta `pnpm run harness:install` y reinicia `pnpm start`. El resultado muestra
+Este instalador configura únicamente el workspace aislado de compatibilidad;
+no instala agentes en las carpetas elegidas por el cliente nativo ni en Codex.
+Ejecuta `pnpm run harness:install` y reinicia `pnpm start:legacy`. El resultado muestra
 `installed`, `enabled` y el commit usado. Prueba pidiendo un trabajo acotado:
 «Delega en arquitecto-skills revisar la coherencia de mis contratos; no cambies
 archivos, solo informa hallazgos». Autoriza únicamente los permisos pertinentes.

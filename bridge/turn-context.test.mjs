@@ -23,6 +23,17 @@ test('restored transcript excludes metadata, tool output, reasoning and media', 
   ]), [{ id: 'm1', role: 'user', text: 'Hola' }, { id: 'm2', role: 'jarvis', text: 'Buenos días.' }])
 })
 
+test('direct audio history shows an audio label without leaking transport markers, encoded audio or synthetic instructions', () => {
+  for (const audio of [
+    { type: 'file', mime: 'audio/mpeg', url: 'data:audio/mpeg;base64,PRIVATE' },
+    { type: 'text', synthetic: true, text: '[mi-asistente-audio:secret]', metadata: { miAsistenteAudio: { data: 'PRIVATE', format: 'mp3' } } },
+  ]) {
+    assert.deepEqual(transcript([{ info: { id: 'audio-one', role: 'user' }, parts: [
+      { type: 'text', synthetic: true, text: 'Private transport instruction' }, audio,
+    ] }]), [{ id: 'audio-one', role: 'user', text: '🎤 Audio enviado' }])
+  }
+})
+
 test('native instruction files exist and the bridge sends no changing system override', async () => {
   const config = JSON.parse(await readFile(new URL('../opencode/xdg/opencode/opencode.json', import.meta.url), 'utf8'))
   await access(new URL('../opencode/workspace/AGENTS.md', import.meta.url))

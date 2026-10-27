@@ -4,6 +4,7 @@ import { speakingNow, speakingSince } from './tts'
 import { startVad, type Vad } from './vad'
 import { caps } from './capabilities'
 import { currentProfile, wakePattern } from './profile'
+import { createVoiceTiming } from './voice-timing'
 
 /**
  * The voice loop.
@@ -36,24 +37,30 @@ export type VoiceMode =
   | 'deaf'
 
 export type VoiceHandlers = {
+  /** Explicit voice standby requires a greeting, not a mention of the name. */
+  requireGreeting?: () => boolean
+  /** Raw speech onset, before transcription latency or turn assembly. */
+  onAudioStart?: (continuation?: boolean) => void
   /** Read fresh on every result, so the app never has to re-subscribe. */
   mode: () => VoiceMode
   /** Fired on his name, from a partial — waiting for endpointing feels slow.
    *  `trailing` is whatever followed it, so "Jarvis, what's the weather" is
    *  one breath rather than two turns. */
-  onWake: (trailing: string) => void
+  onWake: (trailing: string, traceId?: string) => void
   /** The user has genuinely started talking. This is the barge-in trigger. */
   onSpeechStart: () => void
   /** Live transcript, for the caption under the reactor. */
   onPartial: (text: string) => void
   /** A complete, endpointed utterance. */
-  onUtterance: (text: string) => void
+  onUtterance: (text: string, traceId?: string) => void
   /** The recogniser is unusable. Distinct from the user saying nothing. */
   onError: (message: string) => void
 }
 
 export type Voice = {
   stop: () => void
+  /** Submit only actual pending recognition/assembly text, never a caption/status. */
+  commit?: () => boolean
   /** Discard pre-pause audio/transcripts without turning off wake listening. */
   reset?: () => void
   /** True while a recogniser is actually running. */
@@ -86,8 +93,8 @@ const WAKE = {
 }
 
 /** Everything after the wake phrase, which is usually the actual command. */
-function afterWake(text: string): string {
-  const m = WAKE.exec(text)
+function afterWake(text: string, pattern = WAKE): string {
+  const m = pattern.exec(text)
   if (!m) return ''
   return text
     .slice(m.index + m[0].length)
@@ -128,7 +135,7 @@ function afterWake(text: string): string {
  * last word of a real request.
  */
 const CONTINUES =
-  /\b(and|or|but|so|because|since|if|when|while|that|which|who|whose|to|of|in|on|at|by|for|with|from|about|into|onto|over|under|between|through|the|a|an|my|your|his|her|its|our|their|is|are|was|were|be|been|do|does|did|have|has|had|can|could|would|should|will|shall|might|must|like|than|then|as|very|really|just|some|any|all|both|either|neither)$/i
+  /\b(and|or|but|so|because|since|if|when|while|that|which|who|whose|to|of|in|on|at|by|for|with|from|about|into|onto|over|under|between|through|the|a|an|my|your|his|her|its|our|their|is|are|was|were|be|been|do|does|did|have|has|had|can|could|would|should|will|shall|might|must|like|than|then|as|very|really|just|some|any|all|both|either|neither|y|o|pero|porque|que|cuando|mientras|de|del|en|con|por|para|el|la|los|las|un|una|unos|unas|mi|mis|tu|tus|su|sus)$/i
 
 /** Trailing punctuation a transcriber emits mid-thought. */
 const TRAILS = /[,;:–—-]$/
@@ -171,11 +178,14 @@ const MAX_HOLD_MS = 6000
  * How long to keep waiting, given what has been said so far.
  * 0 means "this is a complete thought, send it now".
  */
+const COMPLETE_SHORT = /^(?:[¿¡]\s*)?(?:hola(?:[, ]+¿?c[oó]mo (?:vas|est[aá]s))?|hello|hi|hey|buenos d[ií]as|buenas tardes|buenas noches|gracias|muchas gracias|thanks|thank you|vale|listo|de acuerdo|entendido|perfecto|ok(?:ay)?|s[ií]|no)[.!?]*$/i
+
 function holdFor(text: string): number {
   const words = text.trim().split(/\s+/).filter(Boolean)
   if (!words.length) return CONTINUE_MS
   // An explicit terminator is the speaker telling us they are done.
   if (/[.!?]$/.test(text)) return 0
+  if (COMPLETE_SHORT.test(text.trim())) return SETTLE_MS
   if (TRAILS.test(text.trim())) return CONTINUE_MS
   if (CONTINUES.test(words[words.length - 1])) return CONTINUE_MS
   // One or two words is usually the start of something, not the whole of it —
@@ -192,6 +202,8 @@ type Assembler = {
   /** Throw away whatever is held — used when he stands down. */
   cancel: () => void
   held: () => string
+  /** New speech belongs to the held thought; don't dispatch during its next clause. */
+  resume: () => void
 }
 
 function makeAssembler(h: {
@@ -217,7 +229,7 @@ function makeAssembler(h: {
 
   return {
     feed(text, active) {
-      if (!text.trim()) return
+      if (!text.trim() && !held) return
       held = `${held} ${text}`.replace(/\s+/g, ' ').trim()
       if (!firstAt) firstAt = Date.now()
       // The caption shows the whole thought as it assembles, not just the
@@ -229,7 +241,6 @@ function makeAssembler(h: {
       // Already talking again. Decide nothing now — the next transcript is
       // part of this same sentence and will bring more of it.
       if (active) {
-        timer = setTimeout(fire, MAX_HOLD_MS)
         return
       }
 
@@ -252,6 +263,7 @@ function makeAssembler(h: {
       diag.holding = ''
     },
     held: () => held,
+    resume: clear,
   }
 }
 
@@ -391,7 +403,7 @@ if (typeof window !== 'undefined') {
  * The microphone is opened once here so a denied permission is reported loudly
  * rather than surfacing later as an unexplained deafness, whichever engine runs.
  */
-export async function startVoice(h: VoiceHandlers): Promise<Voice> {
+export async function startVoice(h: VoiceHandlers, options: { browserOnly?: boolean } = {}): Promise<Voice> {
   try {
     await getMic()
   } catch (err) {
@@ -403,12 +415,18 @@ export async function startVoice(h: VoiceHandlers): Promise<Voice> {
     )
     return { stop: () => {}, live: () => false }
   }
-  diag.engine = caps().stt ? 'elevenlabs' : 'browser'
-  return caps().stt ? startElevenVoice(h) : startBrowserVoice(h)
+  const premium = !options.browserOnly && caps().stt
+  diag.engine = premium ? 'elevenlabs' : 'browser'
+  return premium ? startElevenVoice(h) : startBrowserVoice(h)
 }
 
 /** VAD + ElevenLabs Scribe. */
 async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
+  const WAKE = {
+    test: (text: string) => wakePattern(currentProfile(), h.requireGreeting?.() ? 'greeting' : 'any').test(text),
+    exec: (text: string) => wakePattern(currentProfile(), h.requireGreeting?.() ? 'greeting' : 'any').exec(text),
+  }
+  const timing = createVoiceTiming()
   let generation = 0
   let segmentGeneration = 0
   let lastWake = 0
@@ -439,7 +457,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       diag.dropped = ''
       diag.accepted++
       diag.holding = ''
-      h.onUtterance(text)
+      h.onUtterance(text, timing.dispatch())
     },
     partial: (text) => h.onPartial(text),
   })
@@ -456,6 +474,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
     const mine = generation
     const mode = h.mode()
     if (mode === 'deaf') return
+    const recognized = timing.recognizing()
     const t0 = performance.now()
     try {
       const res = await fetch(`${BRIDGE_HTTP_URL}/stt`, {
@@ -467,16 +486,20 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       diag.idleMs = Math.round(performance.now() - t0)
       if (!res.ok) {
         diag.restarts++
+        recognized('error')
+        timing.cancel('error')
         diag.lastError = `stt ${res.status}`
         drop(`transcription failed (${res.status})`)
         return
       }
       const { text } = (await res.json()) as { text?: string }
       if (mine !== generation) return
+      recognized()
       const said = (text ?? '').trim()
       diag.lastError = ''
 
       if (!said) {
+        timing.cancel()
         drop('nothing intelligible in the segment')
         return
       }
@@ -484,6 +507,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       // His own voice, come back through the microphone. The raised guard
       // threshold stops most of it at the door; this catches the rest.
       if (isEcho(said, speakingNow())) {
+        timing.cancel()
         drop('echo of his own voice')
         return
       }
@@ -497,8 +521,10 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
           diag.wakes++
           diag.dropped = ''
           diag.accepted++
-          h.onWake(afterWake(said))
+          timing.onset()
+          h.onWake(afterWake(said, WAKE), timing.dispatch())
         } else {
+          timing.cancel()
           drop(`heard "${said.slice(-40)}" — not his name`)
         }
         return
@@ -506,9 +532,12 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
 
       // Not a turn yet — a piece of one. The assembler decides when the thought
       // is finished, reading the words and whether the room is still noisy.
+      timing.assembling()
       assemble.feed(said, vad?.meter().speaking ?? false)
     } catch (err) {
       if (mine !== generation) return
+      recognized('error')
+      timing.cancel('error')
       diag.restarts++
       diag.lastError = String(err)
       drop('could not reach the speech service')
@@ -525,6 +554,11 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       }
     } finally {
       draining = false
+      // A resumed noise/empty/failed segment must not strand a valid first
+      // clause after onStart suspended its timer. Settle only once truly quiet.
+      if (!pendingAudio.length && !vad?.meter().speaking && ['command', 'guard'].includes(h.mode()) && assemble.held()) {
+        assemble.feed('', false)
+      }
     }
   }
 
@@ -535,9 +569,18 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       diag.mode = mode
       diag.sessions++
       if (mode === 'deaf') return
+      h.onAudioStart?.(draining || pendingAudio.length > 0)
+      if (mode === 'command' || mode === 'guard') assemble.resume()
       // Standing down mid-thought throws the thought away with it. Otherwise
       // held text would surface as the opening of the *next* conversation.
-      if (mode === 'wake') assemble.cancel()
+      if (mode === 'wake') {
+        assemble.cancel()
+        // Another capture can start while Scribe still owns the previous one.
+        // Keep that owner until dispatch; a later queued turn starts at the
+        // observed request boundary rather than borrowing its neighbor's onset.
+        if (!draining && !pendingAudio.length) timing.cancel()
+      }
+      timing.onset()
       // The barge-in. In guard mode the user has started talking over him, and
       // because the guard threshold is high this is a real interruption rather
       // than leaked playback — so cut him off now, do not wait for the words.
@@ -547,11 +590,14 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
           diag.selfGuarded++
           return
         }
+        timing.mark('voice.interruption')
         h.onSpeechStart()
       }
     },
     onEnd: (blob) => {
       if (segmentGeneration !== generation) return
+      // VAD exposes only the completed blob, not the beginning of its quiet
+      // window. Endpoint duration is unavailable here; do not fabricate one.
       pendingAudio.push(blob)
       void drain()
     },
@@ -567,6 +613,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       h.onPartial(v > 0.04 ? '…' : '')
     },
     onError: (message) => {
+      timing.cancel('error')
       diag.lastError = 'capture'
       diag.running = false
       h.onError(message)
@@ -584,17 +631,20 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
     // to the wake word. Anything half-said belonged to a conversation that is
     // over, and letting the hold expire later would open the next one with a
     // fragment of the last.
-    if ((mode === 'wake' || mode === 'deaf') && assemble.held()) assemble.cancel()
+    if ((mode === 'wake' || mode === 'deaf') && assemble.held()) { assemble.cancel(); timing.cancel() }
+    if (mode === 'deaf') timing.cancel()
   }, 200)
 
   return {
     reset: () => {
+      timing.cancel()
       generation++
       pendingAudio.length = 0
       assemble.cancel()
       diag.holding = ''
     },
     stop: () => {
+      timing.cancel()
       generation++
       pendingAudio.length = 0
       clearInterval(guardPoll)
@@ -621,6 +671,10 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
  * assistant that keeps listening.
  */
 function startBrowserVoice(h: VoiceHandlers): Voice {
+  const WAKE = {
+    test: (text: string) => wakePattern(currentProfile(), h.requireGreeting?.() ? 'greeting' : 'any').test(text),
+    exec: (text: string) => wakePattern(currentProfile(), h.requireGreeting?.() ? 'greeting' : 'any').exec(text),
+  }
   const Ctor =
     (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition
   if (!Ctor) {
@@ -628,6 +682,8 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     return { stop: () => {}, live: () => false }
   }
 
+  const timing = createVoiceTiming()
+  let recognitionDone: (() => void) | undefined
   let stopped = false
   let running = false
   let rec: any = null
@@ -637,15 +693,16 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
   let barged = false
   let lastWake = 0
   let lastAlive = Date.now()
+  let speechActive = false
+  let stableFinal = false
+  let lastResult = ''
+  let lastResultText = ''
   let silenceTimer: ReturnType<typeof setTimeout> | null = null
 
   /** Same assembly rules as the premium path — a pause is not a full stop. */
   const assemble = makeAssembler({
     emit: (text) => {
-      diag.dropped = ''
-      diag.accepted++
-      diag.holding = ''
-      h.onUtterance(text)
+      publish(text)
     },
     partial: (text) => h.onPartial(text),
   })
@@ -665,14 +722,36 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     interim = ''
     started = false
     barged = false
+    speechActive = false
+    stableFinal = false
+    lastResult = ''
+    lastResultText = ''
   }
 
   const emit = () => {
+    // Results can arrive in bursts with gaps while the person is still speaking.
+    // A transcription gap alone must not consume the beginning of their clip.
+    if (stopped) return
+    const completeShort = COMPLETE_SHORT.test(`${assemble.held()} ${settled} ${interim}`.trim())
+    if (completeShort && interim.trim() && (h.mode() === 'command' || h.mode() === 'guard')) {
+      // Keep provisional words in recognition until this last settling window.
+      // A changed phrase cancels it; duplicate partials cannot postpone it.
+      silenceTimer = setTimeout(() => { commit() }, SETTLE_MS)
+      return
+    }
+    if (speechActive && !stableFinal && !completeShort) { bumpSilence(); return }
     const text = `${settled} ${interim}`.replace(/\s+/g, ' ').trim()
     const mode = h.mode()
     reset()
-    if (!text || mode === 'deaf') return
+    recognitionDone?.(); recognitionDone = undefined
+    timing.endpointed()
+    if (!text || mode === 'deaf') {
+      if (!text && mode === 'command' && assemble.held()) assemble.feed('', false)
+      else timing.cancel()
+      return
+    }
     if (isEcho(text, speakingNow())) {
+      timing.cancel()
       drop('echo of his own voice')
       return
     }
@@ -685,8 +764,10 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
         diag.wakes++
         diag.dropped = ''
         diag.accepted++
-        h.onWake(afterWake(text))
+        timing.onset()
+        h.onWake(afterWake(text, WAKE), timing.dispatch())
       } else {
+        timing.cancel()
         drop(`heard "${text.slice(-40)}" — not his name`)
       }
       return
@@ -694,6 +775,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     // The recogniser has already endpointed on its own 900ms gap; the assembler
     // decides whether that gap actually ended the thought. `false` because a
     // result only reaches here once the recogniser has gone quiet.
+    timing.assembling()
     assemble.feed(text, false)
   }
 
@@ -704,11 +786,12 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     silenceTimer = setTimeout(emit, 900)
   }
 
-  const onResult = (e: any) => {
+  const onResult = (e: any, finals: Map<number, string>) => {
     touch()
     const mode = h.mode()
     diag.mode = mode
     if (mode === 'deaf') {
+      timing.cancel()
       interim = ''
       return
     }
@@ -716,31 +799,54 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     interim = ''
     for (let i = e.resultIndex; i < e.results.length; i++) {
       const chunk = e.results[i][0].transcript as string
-      if (e.results[i].isFinal) fresh += chunk
-      else interim += chunk
+      if (e.results[i].isFinal) {
+        if (finals.get(i) !== chunk) { fresh = `${fresh} ${chunk}`.trim(); finals.set(i, chunk) }
+      } else interim = `${interim} ${chunk}`.trim()
     }
-    const heard = `${settled}${fresh} ${interim}`.replace(/\s+/g, ' ').trim()
+    if (!fresh.trim() && !interim.trim()) return
+    if (mode === 'wake' && h.requireGreeting?.()) {
+      const incoming = `${fresh} ${interim}`.trim()
+      if (/^hola\b/iu.test(incoming) || !/^hola\b/iu.test(settled.trim())) settled = ''
+    }
+    const heard = `${settled} ${fresh} ${interim}`.replace(/\s+/g, ' ').trim()
     if (!heard) return
+    const resultKey = `${fresh.trim() ? 'final' : 'interim'}:${heard}`
+    if (resultKey === lastResult) return
+    const sameText = heard === lastResultText
+    lastResult = resultKey
+    lastResultText = heard
+    recognitionDone?.(); recognitionDone = undefined
     if (isEcho(`${fresh} ${interim}`, speakingNow())) {
+      if (!settled.trim() && !assemble.held()) timing.cancel()
       interim = ''
       return
     }
 
+    stableFinal = !!fresh.trim() && !interim.trim()
+    if (stableFinal || COMPLETE_SHORT.test(`${assemble.held()} ${heard}`.trim())) timing.endpoint()
+    else timing.endpointed('cancelled')
+
     if (mode === 'wake') {
-      settled += fresh
+      settled = `${settled} ${fresh}`.replace(/\s+/g, ' ').trim()
       if (WAKE.test(heard) && Date.now() - lastWake > WAKE_DEBOUNCE) {
+        // A wake-name partial may already contain the start of a long question.
+        // Wait for its endpoint rather than dispatching that unfinished prefix.
+        if (afterWake(heard, WAKE)) { bumpSilence(); return }
         lastWake = Date.now()
         diag.wakes++
-        const trailing = afterWake(heard)
+        const trailing = afterWake(heard, WAKE)
         reset()
-        h.onWake(trailing)
+        timing.onset()
+        h.onWake(trailing, timing.dispatch())
       } else if (settled.length > 400) {
         settled = ''
       }
       return
     }
 
-    settled += fresh
+    timing.onset()
+    assemble.resume()
+    settled = `${settled} ${fresh}`.replace(/\s+/g, ' ').trim()
     const full = `${settled} ${interim}`.replace(/\s+/g, ' ').trim()
     if (!started || (mode === 'guard' && !barged)) {
       const words = full.split(/\s+/).filter(Boolean).length
@@ -765,7 +871,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
         }
       }
       started = true
-      if (mode === 'guard') barged = true
+      if (mode === 'guard') { barged = true; timing.mark('voice.interruption') }
       h.onSpeechStart()
     }
     diag.dropped = ''
@@ -773,7 +879,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     // may be an earlier half of it held by the assembler.
     const carried = assemble.held()
     h.onPartial(carried ? `${carried} ${full}` : full)
-    bumpSilence()
+    if (!sameText || !silenceTimer) bumpSilence()
   }
 
   const spin = () => {
@@ -782,15 +888,40 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     rec.continuous = true
     rec.interimResults = true
     rec.lang = currentProfile().language || SPEECH_LANG
+    const instance = rec
+    const finals = new Map<number, string>()
+    rec.onspeechstart = () => {
+      if (rec !== instance || stopped || h.mode() === 'deaf') return
+      speechActive = true
+      stableFinal = false
+      timing.endpointed('cancelled')
+      touch()
+      if (!assemble.held() && !settled.trim() && !interim.trim()) timing.cancel()
+      timing.onset()
+      recognitionDone = timing.recognizing()
+      h.onAudioStart?.(h.mode() === 'wake' && WAKE.test(`${settled} ${interim}`))
+      if (h.mode() === 'command' || h.mode() === 'guard') { assemble.resume(); clearSilence() }
+    }
+    rec.onspeechend = () => {
+      if (rec !== instance || stopped) return
+      speechActive = false
+      if (h.mode() === 'wake' && !WAKE.test(`${settled} ${interim}`)) timing.cancel()
+      else timing.endpoint()
+      if (settled.trim() || interim.trim() || assemble.held()) bumpSilence()
+    }
     rec.onstart = () => {
+      if (stopped || rec !== instance) return
       running = true
       diag.running = true
       diag.sessions++
       touch()
     }
-    rec.onresult = onResult
+    rec.onresult = (event: any) => { if (!stopped && rec === instance) onResult(event, finals) }
     rec.onerror = (ev: any) => {
-      if (stopped) return // abort() during teardown is intentional, not a mic failure
+      if (stopped || rec !== instance) return // abort() during teardown is intentional, not a mic failure
+      speechActive = false
+      timing.cancel(ev.error === 'no-speech' || ev.error === 'aborted' ? 'cancelled' : 'error')
+      recognitionDone = undefined
       diag.lastError = String(ev.error ?? '')
       if (ev.error === 'network') {
         h.onError(
@@ -805,6 +936,10 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
       }
     }
     rec.onend = () => {
+      if (stopped || rec !== instance) return
+      speechActive = false
+      if (settled.trim() || interim.trim() || assemble.held()) bumpSilence()
+      if (!settled.trim() && !interim.trim() && !assemble.held()) timing.cancel()
       running = false
       diag.running = false
       touch()
@@ -819,6 +954,43 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     }
   }
 
+  // Sealing a committed recognition session makes its late final results inert.
+  // The shared microphone/PCM owner stays up; only browser dictation is renewed.
+  function rotateRecognizer() {
+    const old = rec
+    rec = null; running = false; diag.running = false
+    if (old) {
+      old.onresult = null; old.onend = null; old.onerror = null; old.onstart = null
+      old.onspeechstart = null; old.onspeechend = null
+      try { old.abort() } catch { /* already ended */ }
+    }
+    touch()
+    if (!stopped) spin()
+  }
+  function publish(text: string) {
+    recognitionDone?.(); recognitionDone = undefined
+    const traceId = timing.dispatch()
+    reset()
+    diag.dropped = ''; diag.accepted++; diag.holding = ''
+    rotateRecognizer()
+    h.onUtterance(text, traceId)
+  }
+  const commit = (): boolean => {
+    if (stopped) return false
+    const mode = h.mode()
+    if (mode !== 'command' && mode !== 'guard') return false
+    const text = [assemble.held(), settled, interim].join(' ').replace(/\s+/g, ' ').trim()
+    if (!text || isEcho(text, speakingNow())) return false
+    if (mode === 'guard') { timing.mark('voice.interruption'); h.onSpeechStart() }
+    timing.onset()
+    timing.endpointed()
+    timing.assembling()
+    assemble.cancel()
+    diag.heard = text; diag.heardAt = Date.now()
+    publish(text)
+    return true
+  }
+
   spin()
 
   // The heartbeat. If nothing has been heard from the engine for a while it has
@@ -827,7 +999,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     if (stopped) return
     const idle = Date.now() - lastAlive
     diag.idleMs = idle
-    if (idle < 15000) return
+    if (idle < 15000 || speechActive && idle < 120000) return
     diag.restarts++
     try {
       rec?.abort()
@@ -835,6 +1007,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
       /* already gone */
     }
     rec = null
+    speechActive = false
     running = false
     diag.running = false
     touch()
@@ -842,33 +1015,25 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
   }, 5000)
 
   return {
+    commit,
     reset: () => {
       if (stopped) return
+      lastWake = 0
+      timing.cancel()
+      recognitionDone = undefined
       reset()
       assemble.cancel()
       diag.holding = ''
-      const old = rec
-      rec = null
-      running = false
-      diag.running = false
-      if (old) {
-        old.onresult = null; old.onend = null; old.onerror = null; old.onstart = null
-        try { old.abort() } catch { /* already ended */ }
-      }
-      touch()
-      spin()
+      rotateRecognizer()
     },
     stop: () => {
+      timing.cancel()
+      recognitionDone = undefined
       stopped = true
       clearInterval(health)
-      clearSilence()
+      reset()
       assemble.cancel()
-      diag.running = false
-      try {
-        rec?.abort()
-      } catch {
-        /* noop */
-      }
+      rotateRecognizer()
     },
     live: () => running,
   }

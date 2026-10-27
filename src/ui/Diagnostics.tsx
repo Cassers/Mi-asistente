@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store'
+import { useVoiceInputMode } from '../lib/voice-input-mode'
+import { getDirectVoiceDiagnostics } from '../lib/direct-voice'
 
 /**
  * The "why can't he hear me / why can't I hear him" panel.
@@ -59,6 +61,7 @@ export function Diagnostics() {
   const [open, setOpen] = useState(false)
   const [, tick] = useState(0)
   const phase = useStore((s) => s.phase)
+  const direct = useVoiceInputMode() === 'direct'
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -81,13 +84,14 @@ export function Diagnostics() {
 
   if (!open) return null
 
-  const w = window as unknown as Record<string, unknown>
-  const v = (w.__voice ?? {}) as Partial<VoiceDiag>
+  const w = (typeof window === 'undefined' ? {} : window) as unknown as Record<string, unknown>
+  const d = getDirectVoiceDiagnostics()
+  const v = (direct ? {} : w.__voice ?? {}) as Partial<VoiceDiag>
   const t = (w.__tts ?? {}) as Partial<TtsDiag>
 
   // The two verdicts worth stating outright, rather than making you infer them
   // from the numbers underneath.
-  const earsOk = Boolean(v.running) && (v.accepted ?? 0) > 0
+  const earsOk = direct ? d.running : Boolean(v.running) && (v.accepted ?? 0) > 0
   const mouthOk = (t.started ?? 0) > 0 || (t.rescued ?? 0) > 0
 
   return (
@@ -96,7 +100,7 @@ export function Diagnostics() {
 
       <div className="diag-verdict">
         <span className={earsOk ? 'diag-ok' : 'diag-bad'}>
-          {earsOk ? '● hearing you' : '● not hearing you'}
+          {direct ? earsOk ? '● PCM capture active' : '● PCM capture stopped' : earsOk ? '● hearing you' : '● not hearing you'}
         </span>
         <span className={mouthOk ? 'diag-ok' : 'diag-bad'}>
           {mouthOk ? '● speaking' : '● no sound produced'}
@@ -104,6 +108,17 @@ export function Diagnostics() {
       </div>
 
       <div className="diag-sec">LISTENING</div>
+      {direct ? <>
+        <Row k="engine" v="direct PCM / VAD" />
+        <Row k="capture" v={d.running ? 'running' : 'STOPPED'} bad={!d.running} />
+        <Row k="captions" v={d.captions === 'unavailable' ? 'unavailable · use Space to activate' : d.captions} />
+        <Row k="mode" v={`${d.mode} (phase ${phase})`} />
+        <Row k="segment" v={d.segment} />
+        <Row k="speech segments" v={String(d.segments)} />
+        <Row k="clips sent" v={String(d.sent)} />
+        <Row k="wakes" v={String(d.wakes)} />
+        <Row k="capture error" v={d.error || '—'} bad={Boolean(d.error)} />
+      </> : <>
       <Row k="recogniser" v={v.running ? 'running' : 'STOPPED'} bad={!v.running} />
       <Row k="sessions" v={String(v.sessions ?? 0)} />
       <Row
@@ -118,6 +133,7 @@ export function Diagnostics() {
       <Row k="last heard" v={v.heard ? `"${v.heard}" ${ago(v.heardAt ?? 0)}` : '— nothing yet'} bad={!v.heard} />
       <Row k="last drop" v={v.dropped || '—'} bad={Boolean(v.dropped)} />
       <Row k="error" v={v.lastError || '—'} bad={Boolean(v.lastError)} />
+      </>}
 
       <div className="diag-sec">SPEAKING · press T to test</div>
       <Row k="engine" v={String(t.engine ?? 'system')} />

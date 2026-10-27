@@ -130,7 +130,7 @@ export const KOKORO_VOICE = choice(
 
 /**
  * Spoken language for recognition and the system voice. es-CO by default
- * (configurable per installation). Kokoro only ships English voices, so with a Spanish
+ * (Colombia). Kokoro only ships English voices, so with a Spanish
  * language the system voice (speechSynthesis) is what speaks.
  */
 export const SPEECH_LANG = str(import.meta.env.VITE_SPEECH_LANG) ?? 'es-CO'

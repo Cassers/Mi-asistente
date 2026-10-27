@@ -8,22 +8,53 @@ let stream: MediaStream | null = null
 let ctx: AudioContext | null = null
 let analyser: AnalyserNode | null = null
 let buf: Uint8Array | null = null
+let blocked = false
+let generation = 0
+let opening: Promise<MediaStream> | null = null
+
+/** Release this application's capture, without muting other apps or the OS. */
+export function setMicBlocked(value: boolean): void {
+  blocked = value
+  if (!value) return
+  generation++
+  opening = null
+  stream?.getTracks().forEach(track => track.stop())
+  stream = null
+  analyser?.disconnect()
+  analyser = null
+  buf = null
+  if (ctx) void ctx.close().catch(() => {})
+  ctx = null
+}
 
 export async function getMic(): Promise<MediaStream> {
+  if (blocked) throw new Error('Micrófono apagado')
   if (stream) return stream
-  stream = await navigator.mediaDevices.getUserMedia({
+  if (opening) return opening
+  const mine = generation
+  const request = navigator.mediaDevices.getUserMedia({
     audio: {
       echoCancellation: true,
       noiseSuppression: true,
       autoGainControl: true,
     },
+  }).then(value => {
+    if (blocked || mine !== generation) {
+      value.getTracks().forEach(track => track.stop())
+      throw new Error('Micrófono apagado')
+    }
+    stream = value
+    return value
   })
-  return stream
+  opening = request
+  try { return await request }
+  finally { if (opening === request) opening = null }
 }
 
 export async function startAnalyser(): Promise<void> {
   if (analyser) return
   const s = await getMic()
+  if (blocked || s !== stream) return
   ctx = new AudioContext()
   const src = ctx.createMediaStreamSource(s)
   analyser = ctx.createAnalyser()

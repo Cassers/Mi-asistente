@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { useStore, type PermissionRequest } from '../store'
+import { NativeInputPrompt } from './NativeInputPrompt'
 import { replyPermission } from '../lib/brain'
 
 /** Real OpenCode approvals, shown as untrusted plain text, never spoken approval. */
 export function PermissionPrompt() {
   const requests = useStore((s) => s.permissions)
   const request = requests[0]
+  if (request?.permission === 'user_input') return <NativeInputPrompt key={request.id} request={request} />
   return request ? <PermissionDialog key={request.id} request={request} count={requests.length} /> : null
 }
 
@@ -49,7 +51,7 @@ export function PermissionDialog({ request, count, onReply = replyPermission }: 
           </div>
           <span className="permission-dialog__kind">{request.permission}</span>
         </header>
-        <p id="permission-description" className="permission-dialog__description">OpenCode solicita tu permiso para esta operación. Las solicitudes que ya estaban pendientes no se autoaprueban al cambiar de modo.</p>
+        <p id="permission-description" className="permission-dialog__description">El asistente solicita tu permiso para esta operación. Las solicitudes que ya estaban pendientes no se autoaprueban al cambiar de modo.</p>
         <div className="permission-dialog__code">
           <div className="permission-dialog__code-label">{typeof request.metadata.command === 'string' ? 'COMANDO SOLICITADO' : 'ALCANCE SOLICITADO'}<span>POR AUTORIZAR</span></div>
           <pre>{typeof request.metadata.command === 'string' ? request.metadata.command : request.patterns.join('\n')}</pre>

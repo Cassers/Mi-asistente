@@ -15,6 +15,9 @@ const client = new Anthropic({
 export type Msg = Anthropic.Beta.BetaMessageParam
 
 export type AskHandlers = {
+  /** Native client accepted this request; separate from the first answer token. */
+  onSubmitted?: () => void
+  onAudio?: (state: 'attached' | 'unsupported' | 'processing' | 'interpreted' | 'fallback', message?: string) => void
   /** Status of the automatic desktop image for this turn (OpenCode bridge). */
   onScreen?: (state: 'capturing' | 'attached' | 'failed') => void
   /** Fires for each chunk of the spoken answer. */

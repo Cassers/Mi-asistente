@@ -1,4 +1,11 @@
-/** Public catalogue contains no provider headers, credentials or opaque options. */
+import { audioEndpoint } from './audio-route.mjs'
+
+/** Supports an MP3 trial, with a transcript fallback if the provider rejects it. */
+export function supportsVoice(model, providerID) {
+  if (model?.capabilities?.input?.audio !== true) return false
+  try { audioEndpoint({ model, modelID: model.id, providerID }); return true } catch { return false }
+}
+
 export function availableModels(catalog) {
   const connected = new Set(catalog?.connected || [])
   return (catalog?.all || []).filter(p => connected.has(p.id)).flatMap(provider => Object.values(provider.models || {}).filter(m =>
@@ -8,7 +15,8 @@ export function availableModels(catalog) {
     id: `${provider.id}/${m.id}`, name: m.name || m.id, provider: provider.name || provider.id,
     free: provider.id === 'opencode' && m.id.endsWith('-free') && m.cost?.input === 0 && m.cost?.output === 0 && Object.values(m.cost?.cache || {}).every(cost => cost === 0),
     cost: { input: Number.isFinite(m.cost?.input) ? m.cost.input : null, output: Number.isFinite(m.cost?.output) ? m.cost.output : null },
-    image: m.capabilities.input.image === true, audio: m.capabilities.input.audio === true,
+    image: m.capabilities.input.image === true, audio: supportsVoice(m, provider.id),
+    ...(m.capabilities.input.audio === true && !supportsVoice(m, provider.id) ? { audioReason: 'Esta conexión no tiene una ruta directa de audio habilitada; se usará la transcripción del dictado.' } : {}),
     variants: Object.entries(m.variants || {}).filter(([, value]) => !value?.disabled).map(([key]) => key),
   }))).sort((a, b) => a.provider.localeCompare(b.provider) || a.name.localeCompare(b.name))
 }

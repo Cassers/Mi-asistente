@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 import ts from 'typescript'
 import { DEFAULT_PROFILE, wakePattern } from '../shared/profile.mjs'
+import { voiceTimingStub } from './timing-fixture.mjs'
 
 function load(name, dependencies, globals) {
   const source = readFileSync(new URL(`../src/lib/${name}.ts`, import.meta.url), 'utf8')
@@ -13,7 +14,7 @@ function load(name, dependencies, globals) {
   const exports = {}
   vm.runInNewContext(code, {
     exports,
-    require: id => { assert.ok(id in dependencies, `unexpected import: ${id}`); return dependencies[id] },
+    require: id => { if (id === './voice-timing') return voiceTimingStub(); assert.ok(id in dependencies, `unexpected import: ${id}`); return dependencies[id] },
     console: { error() {}, warn() {} },
     setTimeout: () => 1, clearTimeout() {}, setInterval: () => 1, clearInterval() {},
     ...globals,
@@ -44,6 +45,30 @@ test('browser recognition network errors reach the visible error handler', async
   assert.equal(voice.diag.lastError, 'network')
   recogniser.onerror({ error: 'not-allowed' })
   assert.match(errors[1], /refused/)
+  input.stop()
+})
+
+test('native VAD marks original audio onset before asynchronous transcription finishes', async () => {
+  let vadHandlers, starts = 0
+  const heard = []
+  const voice = load('voice', {
+    '../config': { SPEECH_LANG: 'es-ES', BRIDGE_HTTP_URL: 'http://fixture' },
+    './audio': { getMic: async () => ({}) },
+    './tts': { speakingNow: () => '', speakingSince: () => 0 },
+    './vad': { startVad: async handlers => {
+      vadHandlers = handlers
+      return { live: () => true, meter: () => ({ speaking: false }), setGuard() {}, stop() {} }
+    } },
+    './capabilities': { caps: () => ({ stt: true }) },
+    './profile': { currentProfile: () => DEFAULT_PROFILE, wakePattern },
+  }, { performance: { now: () => 100 }, fetch: async () => ({ ok: true, json: async () => ({ text: 'Una frase completa.' }) }) })
+  const input = await voice.startVoice({ mode: () => 'command', onAudioStart: () => starts++, onUtterance: text => heard.push(text), onPartial() {}, onError: assert.fail })
+  vadHandlers.onStart()
+  assert.equal(starts, 1)
+  assert.deepEqual(heard, [], 'audio begins before any transcript is available')
+  vadHandlers.onEnd(new Blob(['synthetic audio']))
+  for (let i = 0; i < 12; i++) await Promise.resolve()
+  assert.deepEqual(heard, ['Una frase completa.'])
   input.stop()
 })
 
@@ -108,6 +133,7 @@ test('streamed unknown-speaker labels never reach native speech, at any token bo
 
 test('recognition follows the chosen wake name and changes without reloading', async () => {
   let recogniser
+  let endpoint
   let now = 10000
   let profile = { ...DEFAULT_PROFILE, configured: true, name: 'Atenea' }
   const heard = []
@@ -118,6 +144,7 @@ test('recognition follows the chosen wake name and changes without reloading', a
     './profile': { currentProfile: () => profile, wakePattern },
   }, {
     Date: class extends Date { static now() { return now } },
+    setTimeout: fn => { endpoint = fn; return 1 }, clearTimeout() {},
     window: { SpeechRecognition: class {
       constructor() { recogniser = this }
       start() { this.onstart() }
@@ -127,10 +154,12 @@ test('recognition follows the chosen wake name and changes without reloading', a
   const input = await voice.startVoice({ mode: () => 'wake', onWake: text => heard.push(text), onError: assert.fail })
   const result = text => recogniser.onresult({ resultIndex: 0, results: [Object.assign([{ transcript: text }], { isFinal: true })] })
   result('Hola, Atenea, explícame esto')
+  endpoint()
   assert.deepEqual(heard, ['explícame esto'])
   profile = { ...profile, name: 'Lúa Azul' }
   now += 2000
   result('Hola, Lúa Azul, otra pregunta')
+  endpoint()
   assert.deepEqual(heard, ['explícame esto', 'otra pregunta'])
   assert.equal(recogniser.lang, 'es-CO')
   input.stop()
@@ -229,6 +258,7 @@ test('standby reset discards queued browser transcripts and creates a fresh wake
   result(current, 'una charla cualquiera')
   assert.equal(wakes.length, 0); assert.equal(heard.length, 0)
   result(current, 'hola Diógenes explícame esto')
+  for (const [id, fn] of [...timers]) { timers.delete(id); fn() }
   assert.deepEqual(wakes, ['explícame esto'])
   input.stop()
 })

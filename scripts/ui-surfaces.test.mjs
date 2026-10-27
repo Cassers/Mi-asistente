@@ -12,7 +12,7 @@ function pureModule(name) {
   const exports = {}
   vm.runInNewContext(ts.transpileModule(readFileSync(new URL(`../src/lib/${name}.ts`, import.meta.url), 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
-  }).outputText, { exports })
+  }).outputText, { exports, require })
   return exports
 }
 function component(file, name) {
@@ -24,7 +24,11 @@ function component(file, name) {
   vm.runInNewContext(outputText, { exports, require: id => {
     if (id === '../lib/brain') return { replyPermission: () => assert.fail('render must never authorize') }
     if (id === '../store') return {}
+    if (id === '../lib/native-input') return pureModule('native-input')
     if (id === '../lib/model-search') return pureModule('model-search')
+    if (id === '../lib/voice-input-mode') return pureModule('voice-input-mode')
+    if (id === './NativeInputPrompt') return { NativeInputPrompt: component('NativeInputPrompt', 'NativeInputPrompt') }
+    if (id === './VoiceInputControl') return { VoiceInputControl: component('VoiceInputControl', 'VoiceInputControl') }
     if (id === './SearchableModelSelect') return { SearchableModelSelect: component('SearchableModelSelect', 'SearchableModelSelect') }
     return require(id)
   } })
@@ -38,7 +42,21 @@ const Searchable = component('SearchableModelSelect', 'SearchableModelSelect')
 const { filterModels } = pureModule('model-search')
 const Settings = component('AssistantSettings', 'AssistantSettings')
 const Listening = component('ListeningControl', 'ListeningControl')
+const Microphone = component('MicrophoneControl', 'MicrophoneControl')
+const VoiceInput = component('VoiceInputControl', 'VoiceInputControl')
 const render = (Component, props) => renderToStaticMarkup(React.createElement(Component, props))
+
+test('voice input choice is labelled, defaults to direct audio, explains interruption and exposes status', () => {
+  const html = render(VoiceInput, {})
+  assert.match(html, /Cómo enviar mi voz/)
+  assert.match(html, /<label for="([^"]+)"/)
+  assert.match(html, /value="direct" selected=""/)
+  assert.match(html, /Audio directo · responde en cada pausa/)
+  assert.match(html, /Solo transcripción/)
+  assert.match(html, /aria-describedby=/)
+  assert.match(html, /role="status" aria-live="polite"/)
+  assert.match(render(VoiceInput, { disabled: true }), /<select[^>]*disabled=""/)
+})
 const props = { id: 'one', entries: [{ id: 'one', title: 'Conversación actual', busy: true },
   { id: 'two', title: 'Otra ventana', busy: true }], locked: false, status: 'Chat guardado', error: '',
   onChoose() {}, onRefresh() {}, onDelete() {} }
@@ -58,6 +76,14 @@ test('busy chat disables changing, creating and deleting without removing contex
   assert.equal((html.match(/<button[^>]*disabled=""/g) || []).length, 2)
   assert.match(html, /<select[^>]*disabled=""/)
   assert.match(html, /Respuesta en curso/)
+})
+
+test('native clients may observe and leave busy conversations without enabling deletion', () => {
+  const html = render(Card, { ...props, observeBusy: true, deleteLocked: true, onStop() {} })
+  assert.doesNotMatch(html, /<option value="two" disabled/)
+  assert.equal((html.match(/<button[^>]*disabled=""/g) || []).length, 1)
+  assert.doesNotMatch(html, /<select[^>]*disabled/)
+  assert.match(html, /Detener respuesta/)
 })
 test('connection recovery leaves new-chat available and escapes error text', () => {
   const html = render(Card, { ...props, id: '', entries: [], error: '<script>alert(1)</script>' })
@@ -180,4 +206,52 @@ test('conversation pause is honestly labelled as wake standby, never a hardware 
   assert.match(paused, /Solo activación: di “Diógenes” o pulsa Espacio/)
   assert.match(paused, /historial se controla aparte/)
   assert.match(render(Listening, { ...base, disabled: true }), /disabled=""/)
+})
+
+test('microphone control clearly separates hard capture stop from wake standby', () => {
+  const props = { muted: false, busy: false, historyActive: false, onToggle() {} }
+  const active = render(Microphone, props)
+  assert.match(active, /Apagar micrófono/)
+  assert.match(active, /aria-pressed="true"/)
+  const muted = render(Microphone, { ...props, muted: true })
+  assert.match(muted, /Activar micrófono/)
+  assert.match(muted, /no escucha ni su nombre/)
+  assert.match(muted, /La respuesta continúa/)
+  assert.match(muted, /Historial pausado/)
+  assert.match(muted, /aria-pressed="false"/)
+  assert.match(render(Microphone, { ...props, muted: true, historyActive: true }), /esperando confirmación de pausa/)
+  assert.match(render(Microphone, { ...props, busy: true }), /disabled=""/)
+})
+
+test('stopping output is a separate visible action even when input is muted', () => {
+  const muted = render(Listening, { muted: true, paused: false, disabled: false,
+    name: 'Asistente', onPause() {}, onResume() {} })
+  assert.match(muted, /Detener respuesta/)
+  assert.match(muted, /sin activar el micrófono/)
+  assert.doesNotMatch(muted, /El micrófono sigue activo|Reanudar conversación/)
+})
+
+test('Codex exposes its application, account, native reasoning and recoverable archive labels', () => {
+  const model = { id: 'native-codex', name: 'Native Codex model', provider: 'Codex', free: false, variants: ['low', 'xhigh'], image: true, audio: false }
+  const html = render(Picker, { application: 'codex', onApplication() {}, models: [model], model: model.id, variant: 'xhigh', locked: false, loading: false, error: '', onChoose() {}, onRefresh() {} })
+  assert.match(html, /Codex · Native Codex model · Muy alto/)
+  assert.match(html, /value="codex" selected=""/)
+  assert.match(html, /cuenta configurada en Codex/)
+  assert.doesNotMatch(html, /única aplicación|cuenta configurada en OpenCode/)
+  const archived = render(Card, { id: 'codex-thread', entries: [], locked: false, status: 'Historial nativo de Codex', error: '', onChoose() {}, onRefresh() {}, onDelete() {}, removeLabel: 'Archivar' })
+  assert.match(archived, /Archivar/); assert.doesNotMatch(archived, />Eliminar</)
+})
+
+test('native Codex questions render escaped prompts, secret password fields and explicit response actions', () => {
+  const Input = component('NativeInputPrompt', 'NativeInputPrompt')
+  const html = render(Input, { request: { id: 'codex:number:1', permission: 'user_input', patterns: [], metadata: { questions: [
+    { id: 'secret', question: '<script>clave</script>', isSecret: true, options: null },
+    { id: 'choice', question: 'Elige una opción', isOther: true, options: [{ label: 'Uno', description: 'Primera' }] },
+  ] } } })
+  assert.match(html, /Codex necesita tu respuesta/)
+  assert.match(html, /type="password"/)
+  assert.match(html, /&lt;script&gt;clave&lt;\/script&gt;/)
+  assert.doesNotMatch(html, /<script>|Autorizar solo esta vez/)
+  assert.match(html, /Cancelar solicitud/); assert.match(html, /Enviar respuestas/)
+  assert.match(html, /Escribir otra respuesta/)
 })

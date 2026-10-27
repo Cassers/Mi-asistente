@@ -1,7 +1,12 @@
 import { currentModelSelection } from './models'
+import { currentVoiceInputMode, reportVoiceInput } from './voice-input-mode'
 import type { AskHandlers } from './anthropic'
 import { useStore, type Blade, type Panel, type PermissionRequest } from '../store'
 import { BRIDGE_WS_URL } from '../config'
+import { selectedProject, subscribeProjects } from './projects'
+import { startTiming, newTrace, receiveTiming } from './timings'
+import type { TimingStatus } from './timings'
+import { captureDiagnostics } from './utterance-audio'
 
 /**
  * Client for the local bridge (see bridge/server.mjs).
@@ -17,6 +22,8 @@ import { BRIDGE_WS_URL } from '../config'
 /** Anything the bridge sends. Deliberately loose — a frame from a future
  *  bridge build should be ignored, not crash the turn. */
 type Frame = {
+  event?: unknown
+  status?: TimingStatus
   requestID?: string
   policy?: { mode: PermissionMode; autoApproved: number; error?: string }
   conversation?: Conversation
@@ -35,6 +42,8 @@ type Frame = {
   args?: unknown
   id?: string
   ask?: string
+  turns?: ReturnType<typeof useStore.getState>['turns']
+  busy?: boolean
   reason?: string
   mode?: string
   seconds?: number
@@ -47,11 +56,23 @@ let askSeq = 0
 
 let socket: WebSocket | null = null
 let connecting: Promise<WebSocket> | null = null
+let connectionEpoch = 0
+let destinationRevision = 0
+const connectionTimings = new WeakMap<WebSocket, ReturnType<typeof startTiming>>()
+let stopSequence = 0
+const stops = new WeakMap<WebSocket, { id: string; promise: Promise<void>; resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>()
+function settleStop(ws: WebSocket, error?: Error) {
+  const stop = stops.get(ws)
+  if (!stop) return
+  stops.delete(ws); clearTimeout(stop.timer)
+  if (error) stop.reject(error); else stop.resolve()
+}
 const CHAT_KEY = 'jarvis.opencode.conversation'
+const chatKey = () => selectedProject() ? `${CHAT_KEY}:${selectedProject()!.id}` : CHAT_KEY
 let requestedConversation: string | null = null
 let manualSwitch = false
 export type ConversationEntry = { id: string; title: string; updatedAt: number; busy: boolean }
-export type Conversation = { id: string; title: string; resumed: boolean; turns: ReturnType<typeof useStore.getState>['turns']; entries: ConversationEntry[] }
+export type Conversation = { id: string; title: string; resumed: boolean; turns: ReturnType<typeof useStore.getState>['turns']; entries: ConversationEntry[]; busy?: boolean }
 let conversation: Conversation | null = null
 let conversationView: { chat: Conversation | null; error: string } = { chat: null, error: '' }
 const conversationListeners = new Set<() => void>()
@@ -83,6 +104,8 @@ export function setPermissionMode(mode: PermissionMode, confirmed = false) {
   }, 5000)
 }
 export function conversationSnapshot() { return conversationView }
+/** Changes only when the user switches projects/chats, including while a chat is opening. */
+export function conversationRevision() { return destinationRevision }
 export function subscribeConversation(fn: () => void) {
   conversationListeners.add(fn)
   return () => { conversationListeners.delete(fn) }
@@ -95,9 +118,14 @@ export function refreshConversations() {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'session_list' }))
 }
 export async function chooseConversation(id: string = 'new') {
-  if (pending) throw new Error('Termina o interrumpe la respuesta antes de cambiar de chat.')
+  if (pending && !pending.direct && !selectedProject()) throw new Error('Termina o interrumpe la respuesta antes de cambiar de chat.')
+  detachDirectClips()
+  pending?.finish(undefined, 'detached')
+  destinationRevision++
+  conversation = null; publishConversation()
   requestedConversation = id
   manualSwitch = true
+  connectionEpoch++; connecting = null
   clearTimeout(reconnectTimer)
   const old = socket
   if (old && old.readyState !== WebSocket.CLOSED) {
@@ -111,7 +139,7 @@ export async function chooseConversation(id: string = 'new') {
   await warmBridge()
 }
 export function deleteConversation() {
-  if (!conversation || pending || socket?.readyState !== WebSocket.OPEN) throw new Error('El chat debe estar conectado y sin respuesta pendiente.')
+  if (!conversation || pending || directClips.size || socket?.readyState !== WebSocket.OPEN) throw new Error('El chat debe estar conectado y sin respuesta pendiente.')
   publishConversation()
   socket.send(JSON.stringify({ type: 'session_delete', id: conversation.id }))
 }
@@ -131,10 +159,31 @@ let onRecording: ((state: NonNullable<Frame['recording']>) => void) | null = nul
 export function watchRecording(fn: NonNullable<typeof onRecording>) { onRecording = fn }
 let onPermissions: ((requests: PermissionRequest[]) => void) | null = null
 export function watchPermissions(fn: NonNullable<typeof onPermissions>) { onPermissions = fn }
-export async function replyPermission(id: string, reply: 'once' | 'reject') {
-  // Never reconnect to approve an old session's request.
-  if (socket?.readyState !== WebSocket.OPEN) throw new Error('Conexión perdida; permiso no enviado.')
-  socket.send(JSON.stringify({ type: 'permission', id, reply }))
+let permissionIDs = new Set<string>()
+const nativeReplies = new Map<string, { ws: WebSocket; resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>()
+function settleNativeReply(id: string, error?: Error) {
+  const pending = nativeReplies.get(id)
+  if (!pending) return
+  clearTimeout(pending.timer); nativeReplies.delete(id)
+  if (error) pending.reject(error); else pending.resolve()
+}
+function sendNativeReply(id: string, payload: Record<string, unknown>): Promise<void> {
+  if (socket?.readyState !== WebSocket.OPEN) return Promise.reject(new Error('Conexión perdida; respuesta no enviada.'))
+  if (!permissionIDs.has(id)) return Promise.reject(new Error('La solicitud venció o pertenece a otra conversación.'))
+  if (nativeReplies.has(id)) return Promise.reject(new Error('Esta respuesta ya se está enviando.'))
+  const ws = socket
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => settleNativeReply(id, new Error('No se confirmó la respuesta. Comprueba la solicitud antes de reintentar.')), 10000)
+    nativeReplies.set(id, { ws, resolve, reject, timer })
+    try { ws.send(JSON.stringify({ ...payload, id })) }
+    catch { settleNativeReply(id, new Error('No se pudo enviar la respuesta.')) }
+  })
+}
+export function replyPermission(id: string, reply: 'once' | 'reject') {
+  return sendNativeReply(id, { type: 'permission', reply })
+}
+export function replyUserInput(id: string, answers: Record<string, { answers: string[] }>) {
+  return sendNativeReply(id, { type: 'user_input', answers })
 }
 export async function setRecordingActive(active: boolean) {
   const ws = await connect()
@@ -255,14 +304,23 @@ function dispatch(ws: WebSocket) {
       return
     }
 
-    if (msg.type === 'session_error') {
+    if (msg.type === 'interrupted' && stops.get(ws)?.id === msg.requestID) {
+      settleStop(ws, msg.status === 'ok' ? undefined : new Error('La aplicación no confirmó la detención de la respuesta anterior.'))
+    } else if (msg.type === 'session_error') {
+      connectionTimings.get(ws)?.end('error')
       publishConversation(msg.message || 'No se pudo abrir la conversación.')
+    } else if (msg.type === 'status_error') {
+      const error = new Error(msg.message || 'La aplicación no pudo completar la operación.')
+      if (msg.ask || msg.requestID) settleNativeReply((msg.ask || msg.requestID)!, error)
+      useStore.getState().setError?.(error.message)
+    } else if (msg.type === 'timing') {
+      receiveTiming(msg.event)
     } else if (msg.type === 'session_list' && conversation && msg.entries) {
       conversation = { ...conversation, entries: msg.entries }
       publishConversation()
     } else if (msg.type === 'session_deleted') {
       requestedConversation = 'new'
-      try { localStorage.removeItem(CHAT_KEY) } catch { /* storage may be disabled */ }
+      try { localStorage.removeItem(chatKey()) } catch { /* storage may be disabled */ }
       conversation = null
       useStore.setState({ turns: [], caption: '' })
       publishConversation()
@@ -272,14 +330,23 @@ function dispatch(ws: WebSocket) {
       publishPolicy({ mode: msg.policy.mode, autoApproved: msg.policy.autoApproved, connected: true,
         ...(settled ? { pending: false } : {}), error: msg.policy.error || '' }, settled)
     } else if (msg.type === 'permissions' && Array.isArray(msg.requests)) {
+      permissionIDs = new Set(msg.requests.map(request => request.id))
+      for (const [id, pending] of nativeReplies) if (pending.ws === ws && !permissionIDs.has(id)) settleNativeReply(id)
       onPermissions?.(msg.requests)
     } else if (msg.type === 'recording' && msg.recording) {
       onRecording?.(msg.recording)
+    } else if (msg.type === 'session_update' && Array.isArray(msg.turns)) {
+      useStore.setState({ turns: msg.turns })
+      if (conversation) { conversation = { ...conversation, turns: msg.turns, busy: msg.busy === true }; publishConversation() }
+    } else if (msg.type === 'project_required') {
+      connectionTimings.get(ws)?.end()
+      servers = []; firstReady.resolve()
     } else if (msg.type === 'ready') {
+      connectionTimings.get(ws)?.end()
       if (msg.conversation) {
         conversation = msg.conversation
         requestedConversation = conversation.id
-        try { localStorage.setItem(CHAT_KEY, conversation.id) } catch { /* session still works without browser storage */ }
+        try { localStorage.setItem(chatKey(), conversation.id) } catch { /* session still works without browser storage */ }
         useStore.setState({ turns: conversation.turns, caption: '', screenCapture: 'off', error: null })
         publishConversation()
       }
@@ -328,16 +395,22 @@ function dispatch(ws: WebSocket) {
 function connect(): Promise<WebSocket> {
   if (socket?.readyState === WebSocket.OPEN) return Promise.resolve(socket)
   if (connecting) return connecting
+  const epoch = ++connectionEpoch
+  const connectionSpan = startTiming('connection.ready')
 
   firstReady = deferred()
 
   connecting = new Promise<WebSocket>((resolve, reject) => {
     const url = new URL(BRIDGE_WS_URL)
+    url.searchParams.set('trace', connectionSpan.traceId)
+    const projectID = selectedProject()?.id || ''
+    if (projectID) url.searchParams.set('project', projectID)
     let stored: string | null = null
-    try { stored = localStorage.getItem(CHAT_KEY) } catch { /* storage may be disabled */ }
+    try { stored = localStorage.getItem(chatKey()) } catch { /* storage may be disabled */ }
     const selected = requestedConversation || stored
     if (selected) url.searchParams.set('session', selected)
     const ws = new WebSocket(url)
+    connectionTimings.set(ws, connectionSpan)
     let settled = false
 
     /**
@@ -350,8 +423,8 @@ function connect(): Promise<WebSocket> {
       if (settled) return
       settled = true
       clearTimeout(timer)
-      connecting = null
-      if (err) reject(err)
+      if (epoch === connectionEpoch) connecting = null
+      if (err) { connectionSpan.end('error'); reject(err) }
       else resolve(ws)
     }
 
@@ -361,9 +434,11 @@ function connect(): Promise<WebSocket> {
     }, 6000)
 
     ws.onopen = () => {
+      if (epoch !== connectionEpoch || (selectedProject()?.id || '') !== projectID) { ws.close(); settle(new Error('El proyecto cambió.')); return }
       policyRequestID = null
       publishPolicy({ mode: 'manual', autoApproved: 0, connected: false, pending: false, error: '' })
       socket = ws
+      permissionIDs = new Set()
       attempt = 0
       dispatch(ws)
       settle(null)
@@ -394,6 +469,10 @@ function connect(): Promise<WebSocket> {
       )
     }
     ws.onclose = () => {
+      for (const [id, pending] of nativeReplies) if (pending.ws === ws) settleNativeReply(id, new Error('La conexión cambió antes de confirmar tu respuesta.'))
+      if (socket === ws) permissionIDs = new Set()
+      settleStop(ws, new Error('La conexión cambió antes de confirmar la interrupción.'))
+      connectionSpan.end('detached')
       // A close before open is just a failed dial; after open it's a lost
       // session, and the two want different handling.
       settle(new Error('The bridge closed the connection.'))
@@ -435,12 +514,137 @@ export async function warmBridge(): Promise<void> {
 const IDLE_TIMEOUT_MS = 120_000
 
 /** The turn in flight, so a barge-in can settle it locally. */
-let pending: { finish: (fallback?: string) => void } | null = null
+type TurnResult = { text: string; tools: string[]; status?: TimingStatus }
+type Selection = { model?: string; variant?: string }
+type DirectClip = {
+  scope: number; project: string; session: string | null
+  audio: import('./utterance-audio').VoiceClip
+  preserveOnly: boolean; sent: boolean; submittedPreserveOnly: boolean; discarded: boolean
+  text: string; tools: string[]; uiDone: boolean
+  resolve: (value: TurnResult) => void; reject: (error: unknown) => void
+  aborted: Promise<void>; abandon: () => void; discardedStatus: TimingStatus
+  selection?: Promise<{ value: Selection; error?: never } | { value?: never; error: unknown }>
+  queued: ReturnType<typeof startTiming>
+}
+type PendingSlot = { finish: (fallback?: string, status?: TimingStatus) => void; fail?: (error: Error) => void; direct?: DirectClip }
+let pending: PendingSlot | null = null
+let directScope = 0
+let directLane: Promise<void> = Promise.resolve()
+const directClips = new Set<DirectClip>()
+class DirectAbandoned extends Error {
+  readonly status: TimingStatus
+  constructor(status: TimingStatus) { super('El destino de este clip ya no está activo.'); this.status = status }
+}
+function validDirect(clip: DirectClip) {
+  return !clip.discarded && clip.scope === directScope && clip.project === (selectedProject()?.id || '') &&
+    (!clip.session || clip.session === 'new' || !conversation || conversation.id === clip.session)
+}
+function cancelDirectUI(clip: DirectClip, status: TimingStatus = 'cancelled') {
+  if (clip.uiDone) return
+  clip.uiDone = true
+  clip.resolve({ text: clip.text.trim(), tools: [...clip.tools], status })
+}
+function discardDirect(clip: DirectClip, status: TimingStatus) {
+  if (clip.discarded) return
+  clip.discarded = true; clip.discardedStatus = status
+  clip.queued.end(status)
+  cancelDirectUI(clip, status)
+  clip.abandon()
+}
+function detachDirectClips() {
+  directScope++
+  for (const clip of directClips) discardDirect(clip, 'detached')
+}
+async function waitDirect<T>(work: Promise<T>, clip?: DirectClip): Promise<T> {
+  if (!clip) return work
+  if (!validDirect(clip)) throw new DirectAbandoned(clip.discardedStatus)
+  return Promise.race([work, clip.aborted.then(() => { throw new DirectAbandoned(clip.discardedStatus) })])
+}
+async function waitForStop(ws: WebSocket, traceId: string, clip?: DirectClip) {
+  const stop = stops.get(ws)
+  if (!stop) return
+  const wait = startTiming('turn.interrupt_wait', traceId)
+  try { await waitDirect(stop.promise, clip); wait.end() }
+  catch (error) { wait.end(error instanceof DirectAbandoned ? error.status : 'error'); throw error }
+}
+/** A UI answer may be cancelled immediately; its captured audio still owns this
+ * serial delivery lane until native persistence + the stop barrier are settled. */
+export function ask(
+  prompt: string, handlers: AskHandlers, audio?: import('./utterance-audio').VoiceClip,
+  traceId: string = newTrace(),
+  options?: { audioMode?: 'transcript' },
+): Promise<TurnResult> {
+  const audioMode = options?.audioMode || currentVoiceInputMode()
+  if (audioMode !== 'direct') {
+    if (!directClips.size) return askTurn(prompt, handlers, audio, traceId, audioMode)
+    const scope = directScope
+    cancel('speech')
+    return directLane.then(() => scope === directScope
+      ? askTurn(prompt, handlers, audio, traceId, audioMode) : { text: '', tools: [], status: 'detached' as TimingStatus })
+  }
+  if (!audio) return Promise.reject(new Error('Falta el clip de audio directo; no se enviará dictado como sustituto.'))
+  if (directClips.size || pending) cancel('speech')
+  let resolve!: DirectClip['resolve'], reject!: DirectClip['reject'], abandon!: () => void
+  const result = new Promise<TurnResult>((yes, no) => { resolve = yes; reject = no })
+  const aborted = new Promise<void>(yes => { abandon = yes })
+  let session = conversation?.id || requestedConversation
+  if (!session) { try { session = localStorage.getItem(chatKey()) } catch { /* optional storage */ } }
+  let selection: DirectClip['selection']
+  if ((servers.includes('opencode') || servers.includes('codex'))) {
+    // Invoke now, not when an older clip finally frees the lane. Cached model
+    // choice is captured with this utterance rather than a later UI selection.
+    try { selection = currentModelSelection().then(value => ({ value }), error => ({ error })) }
+    catch (error) { selection = Promise.resolve({ error }) }
+  }
+  const clip: DirectClip = {
+    scope: directScope, project: selectedProject()?.id || '', session,
+    audio: { mime: audio.mime, data: audio.data }, preserveOnly: false, sent: false, submittedPreserveOnly: false,
+    discarded: false, discardedStatus: 'detached', text: '', tools: [], uiDone: false,
+    resolve, reject, aborted, abandon, selection, queued: startTiming('audio.queue', traceId),
+  }
+  directClips.add(clip)
+  const audible = () => !clip.preserveOnly && !clip.discarded && !clip.uiDone
+  const guarded: AskHandlers = {
+    onSubmitted() { if (audible()) handlers.onSubmitted?.() },
+    onText(delta) { if (audible()) { clip.text += delta; handlers.onText(delta) } },
+    onTool(name) { if (audible()) { clip.tools.push(name); handlers.onTool(name) } },
+    onAudio(state, message) { if (audible()) handlers.onAudio?.(state, message) },
+    onScreen(state) { if (audible()) handlers.onScreen?.(state) },
+  }
+  const job = async () => {
+    try {
+      if (!validDirect(clip)) { discardDirect(clip, 'detached'); return }
+      clip.queued.end()
+      const value = await askTurn(prompt, guarded, clip.audio, traceId, audioMode, clip)
+      if (!clip.uiDone) { clip.uiDone = true; clip.resolve(clip.preserveOnly ? { ...value, status: 'cancelled' } : value) }
+    } catch (error) {
+      if (!clip.uiDone) { clip.uiDone = true; clip.reject(error) }
+      // An uncertain persistence/stop failure must be visible and must not let
+      // newer clips overtake it. No automatic replay can duplicate native audio.
+      for (const waiting of directClips) {
+        if (waiting === clip || waiting.scope !== clip.scope) continue
+        if (!waiting.uiDone) { waiting.uiDone = true; waiting.reject(error) }
+        waiting.discarded = true; waiting.queued.end('error'); waiting.abandon()
+      }
+      reportVoiceInput('No se confirmó la entrega ordenada del audio. Comprueba la conversación antes de continuar.')
+    } finally { directClips.delete(clip) }
+  }
+  directLane = directLane.then(job, job)
+  return result
+}
 
-export async function ask(
+async function askTurn(
   prompt: string,
   handlers: AskHandlers,
-): Promise<{ text: string; tools: string[] }> {
+  audio: import('./utterance-audio').VoiceClip | undefined,
+  traceId: string,
+  audioMode: ReturnType<typeof currentVoiceInputMode>,
+  direct?: DirectClip,
+): Promise<TurnResult> {
+  reportVoiceInput(audioMode === 'direct' ? 'Preparando el clip para enviarlo a la aplicación…'
+    : audioMode === 'transcript' ? 'Entrada por transcripción: no se envía audio.' : audio ? 'Preparando tu clip MP3…'
+    : captureDiagnostics().status === 'overflow' ? 'La intervención supera el límite de 60 s: se envía el dictado completo en lugar de un audio recortado.'
+      : 'No hay un clip completo verificable; se usa el texto del dictado.')
   /**
    * A new question supersedes the one in flight.
    *
@@ -463,35 +667,61 @@ export async function ask(
    * below claims the slot there is nothing left to collide with. The abandoned
    * turn's caller sees its own `stale()` check and stands down quietly.
    */
-  if (pending) cancel()
+  if (pending) {
+    if (direct) pending.finish(undefined, 'cancelled')
+    else cancel()
+  }
 
   // Claim the slot in this same tick. connect() below awaits, and two calls
   // made before it settles would otherwise both sail past the check above.
   let cancelledWhileDialling = false
-  pending = {
+  let slot: PendingSlot = {
+    direct,
     finish: () => {
       cancelledWhileDialling = true
     },
   }
+  pending = slot
+  const releasePending = () => { if (pending === slot) pending = null }
 
   let ws: WebSocket
+  const connectionWait = startTiming('turn.connection', traceId)
   try {
-    ws = await connect()
+    ws = await waitDirect(connect(), direct)
+    connectionWait.end()
+    await waitForStop(ws, traceId, direct)
   } catch (err) {
-    pending = null
-    throw err
+    const failure = direct && !validDirect(direct) ? new DirectAbandoned(direct.discardedStatus) : err
+    connectionWait.end(failure instanceof DirectAbandoned ? failure.status : 'error')
+    releasePending()
+    if (failure instanceof DirectAbandoned) return { text: '', tools: [], status: failure.status }
+    throw failure
   }
 
   // Barged in on before the socket was even up. Nothing was ever asked.
   if (cancelledWhileDialling) {
-    pending = null
-    return { text: '', tools: [] }
+    releasePending()
+    return { text: '', tools: [], status: 'cancelled' }
   }
 
-  let selection: { model?: string; variant?: string } = {}
-  try { if (servers.includes('opencode')) selection = await currentModelSelection() }
-  catch (err) { pending = null; throw err }
-  if (cancelledWhileDialling) { pending = null; return { text: '', tools: [] } }
+  let selection: Selection = {}
+  const selectionSpan = startTiming('turn.selection', traceId)
+  try {
+    if (direct?.selection) {
+      const chosen = await waitDirect(direct.selection, direct)
+      if ('error' in chosen) throw chosen.error
+      selection = chosen.value
+    } else if ((servers.includes('opencode') || servers.includes('codex'))) selection = await waitDirect(currentModelSelection(), direct)
+    await waitForStop(ws, traceId, direct)
+    if (direct && !validDirect(direct)) throw new DirectAbandoned(direct.discardedStatus)
+    selectionSpan.end()
+  } catch (err) {
+    const failure = direct && !validDirect(direct) ? new DirectAbandoned(direct.discardedStatus) : err
+    selectionSpan.end(failure instanceof DirectAbandoned ? failure.status : 'error'); releasePending()
+    if (failure instanceof DirectAbandoned) return { text: '', tools: [], status: failure.status }
+    throw failure
+  }
+  if (cancelledWhileDialling) { releasePending(); return { text: '', tools: [], status: 'cancelled' } }
   const id = `a${++askSeq}`
   const tools: string[] = []
   let text = ''
@@ -499,26 +729,32 @@ export async function ask(
   return new Promise((resolve, reject) => {
     let done = false
     let timer = 0
+    const firstText = startTiming('turn.first_text', traceId)
+    const firstActivity = startTiming('turn.first_activity', traceId)
+    const responseSpan = startTiming('turn.response', traceId)
 
     const cleanup = () => {
       done = true
-      pending = null
+      releasePending()
       clearTimeout(timer)
       ws.removeEventListener('message', onMessage)
       ws.removeEventListener('close', onClose)
       ws.removeEventListener('error', onError)
     }
 
-    const finish = (fallback = '') => {
+    const finish = (fallback = '', status: TimingStatus = 'ok') => {
       if (done) return
+      firstText.end(text || fallback ? status : status === 'ok' ? 'cancelled' : status)
+      firstActivity.end(status); responseSpan.end(status)
       cleanup()
       // Prefer the streamed text; fall back to the final result if this build
       // didn't emit deltas.
-      resolve({ text: (text || fallback).trim(), tools })
+      resolve({ text: (text || fallback).trim(), tools, status })
     }
 
-    const fail = (err: Error) => {
+    const fail = (err: Error, status: TimingStatus = 'error') => {
       if (done) return
+      firstText.end(status); firstActivity.end(status); responseSpan.end(status)
       cleanup()
       reject(err)
     }
@@ -526,7 +762,7 @@ export async function ask(
     const arm = () => {
       clearTimeout(timer)
       timer = window.setTimeout(() => {
-        fail(new Error('El servidor dejó de responder en este turno. Puedes intentarlo de nuevo.'))
+        fail(new Error('El servidor dejó de responder en este turno. Puedes intentarlo de nuevo.'), 'timeout')
       }, IDLE_TIMEOUT_MS)
     }
 
@@ -557,24 +793,38 @@ export async function ask(
 
       try {
         switch (msg.type) {
+          case 'submitted':
+            firstActivity.end()
+            handlers.onSubmitted?.()
+            break
+          case 'audio':
+            firstActivity.end()
+            if (msg.state === 'attached' || msg.state === 'unsupported' || msg.state === 'processing' || msg.state === 'interpreted' || msg.state === 'fallback') {
+              if (msg.message && !direct?.preserveOnly) reportVoiceInput(msg.message)
+              handlers.onAudio?.(msg.state, msg.message)
+            }
+            break
           case 'screen':
+            firstActivity.end()
             if (msg.state === 'capturing' || msg.state === 'attached' || msg.state === 'failed') {
               handlers.onScreen?.(msg.state)
             }
             break
           case 'text':
+            if (msg.delta) { firstText.end(); firstActivity.end() }
             text += msg.delta ?? ''
             handlers.onText(msg.delta ?? '')
             break
 
           case 'tool':
+            firstActivity.end()
             if (!msg.name) break
             tools.push(msg.name)
             handlers.onTool(prettyToolName(msg.name))
             break
 
           case 'done':
-            finish(msg.text ?? '')
+            finish(msg.text ?? '', msg.status === 'cancelled' ? 'cancelled' : 'ok')
             break
 
           case 'error':
@@ -593,14 +843,19 @@ export async function ask(
       fail(new Error('The connection to the bridge failed.'))
     }
 
-    pending = { finish }
+    slot = { finish, fail, direct }; pending = slot
     ws.addEventListener('message', onMessage)
     ws.addEventListener('close', onClose)
     ws.addEventListener('error', onError)
     arm()
 
     try {
-      ws.send(JSON.stringify({ type: 'ask', text: prompt, id, ...selection }))
+      if (direct) {
+        if (!validDirect(direct) || socket !== ws) { finish('', 'detached'); return }
+        direct.sent = true; direct.submittedPreserveOnly = direct.preserveOnly
+      }
+      ws.send(JSON.stringify({ type: 'ask', text: prompt, id, traceId, ...selection, audioMode,
+        ...(direct?.preserveOnly ? { preserveOnly: true } : {}), ...(audio && audioMode !== 'transcript' ? { audio } : {}) }))
     } catch (err) {
       // The socket can go into CLOSING between connect() resolving and here.
       fail(err instanceof Error ? err : new Error(String(err)))
@@ -616,17 +871,71 @@ export async function ask(
  * already said is returned, so the caller's await always comes back and the
  * transcript keeps the half-sentence the user actually heard.
  */
-export function cancel(): void {
+function requestStop(reason: 'speech' | 'manual') {
   if (socket?.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ type: 'interrupt' }))
+    const ws = socket
+    if (!stops.has(ws)) {
+      const id = `stop-${++stopSequence}`
+      let resolve!: () => void, reject!: (error: Error) => void
+      const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no })
+      // A stop can finish without a replacement clip; keep failures observed.
+      void promise.catch(() => {})
+      const timer = setTimeout(() => settleStop(ws, new Error('La aplicación tardó demasiado en confirmar la detención.')), 16000)
+      stops.set(ws, { id, promise, resolve, reject, timer })
+      try { ws.send(JSON.stringify({ type: 'interrupt', reason, requestID: id })) }
+      catch { settleStop(ws, new Error('No se pudo enviar la detención a la aplicación.')) }
+    }
   }
-  pending?.finish()
+  return socket ? stops.get(socket)?.promise : undefined
+}
+export function cancel(reason: 'speech' | 'manual' = 'manual'): void {
+  const owner = pending
+  if (reason === 'speech') {
+    for (const clip of directClips) { clip.preserveOnly = true; cancelDirectUI(clip) }
+    // Unsent clips continue preparing as noReply commits. An already submitted
+    // noReply commit also needs no abort: the serial lane waits for its receipt.
+    if (owner?.direct && (!owner.direct.sent || owner.direct.submittedPreserveOnly)) return
+    if (!owner && directClips.size) return
+  } else {
+    for (const clip of directClips) discardDirect(clip, 'cancelled')
+  }
+  const stop = requestStop(reason)
+  if (reason === 'speech' && owner?.direct) {
+    // Keep the transport listener alive while the UI is already cancelled.
+    // Backend stop ack confirms durable audio persistence, not just cancellation.
+    void stop?.then(() => {
+      if (pending === owner) owner.finish(undefined, 'cancelled')
+    }, error => { if (pending === owner) owner.fail?.(error) })
+  } else owner?.finish(undefined, 'cancelled')
 }
 
 /** The older name for `cancel()`. */
-export function interrupt(): void {
-  cancel()
+export function interrupt(reason: 'speech' | 'manual' = 'manual'): void {
+  cancel(reason)
 }
+
+let activeProjectID = ''
+subscribeProjects(() => {
+  const id = selectedProject()?.id || ''
+  if (id === activeProjectID) return
+  activeProjectID = id
+  destinationRevision++
+  // Detach only: native work survives closing or switching this client.
+  detachDirectClips()
+  pending?.finish(undefined, 'detached')
+  requestedConversation = null; conversation = null; publishConversation()
+  useStore.setState({ turns: [], caption: '', permissions: [], screenCapture: 'off' })
+  manualSwitch = true
+  connectionEpoch++; connecting = null
+  clearTimeout(reconnectTimer)
+  const old = socket
+  const reconnect = () => {
+    manualSwitch = false
+    if (id === activeProjectID) void warmBridge().catch(error => publishConversation(String(error)))
+  }
+  if (old && old.readyState !== WebSocket.CLOSED) { old.addEventListener('close', reconnect, { once: true }); old.close() }
+  else reconnect()
+})
 
 /** `mcp__higgsfield__generate_image` -> `higgsfield · generate image` */
 function prettyToolName(raw: string): string {

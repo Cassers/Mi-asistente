@@ -1,0 +1,41 @@
+type Props = {
+  muted: boolean
+  busy: boolean
+  onToggle: () => void
+  historyActive: boolean
+  inactive?: boolean
+  standby?: boolean
+  name?: string
+  onStandby?: () => void
+}
+
+export function MicrophoneControl({ muted, busy, onToggle, historyActive, inactive = false,
+  standby = false, name = 'Asistente', onStandby }: Props) {
+  const off = muted || inactive
+  const wakeControl = !!onStandby && !off
+  return <div className="microphone-control" data-muted={off} data-standby={wakeControl && standby}>
+    <div className="microphone-actions">
+      <button type="button" className="surface-button" aria-pressed={!off && !(wakeControl && standby)}
+        disabled={busy} onClick={wakeControl ? onStandby : onToggle} aria-describedby="microphone-explanation">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M9 5a3 3 0 0 1 6 0v7a3 3 0 0 1-6 0ZM5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8" />
+          {(off || wakeControl && standby) && <path d="m3 3 18 18" />}
+        </svg>
+        {busy ? 'Activando micrófono…' : off ? 'Activar micrófono'
+          : wakeControl ? standby ? 'Reactivar escucha' : 'Silenciar conversación' : 'Apagar micrófono'}
+      </button>
+      {wakeControl && <button type="button" className="surface-button microphone-hardoff" disabled={busy}
+        onClick={onToggle} aria-describedby="microphone-hardoff-explanation">Apagar por completo</button>}
+    </div>
+    <span id="microphone-explanation" role="status">{muted
+      ? `Micrófono apagado: no escucha ni su nombre. La respuesta continúa.${historyActive ? ' Historial: esperando confirmación de pausa…' : ' Historial pausado.'}`
+      : inactive
+        ? 'Activa la voz para usar el micrófono. Abrir proyectos no inicia captura de audio.'
+        : wakeControl
+          ? standby
+            ? `Di «hola, ${name}» para reactivar. El micrófono sigue escuchando la activación; la respuesta continúa.`
+            : 'Escucha activa. Silenciar conversación mantiene la activación por voz y la respuesta.'
+          : 'Micrófono del asistente activo. Apágalo para hablar con tus estudiantes.'}</span>
+    {wakeControl && <span id="microphone-hardoff-explanation">Apagar por completo impide reactivar por voz.</span>}
+  </div>
+}

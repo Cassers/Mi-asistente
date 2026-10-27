@@ -1,8 +1,10 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useStore, accentFor, type Phase } from '../store'
 import { ResponseText } from './ResponseText'
 import { ListeningControl } from './ListeningControl'
+import { MicrophoneControl } from './MicrophoneControl'
+import { MessageComposer } from './MessageComposer'
 import { Suggestions } from './Suggestions'
 import { BladeSweep, Blades } from './Blades'
 import { Effects } from './Effects'
@@ -10,6 +12,7 @@ import { Pointer } from './Pointer'
 import { GestureGuide } from './GestureGuide'
 import { setRecordingActive } from '../lib/brain'
 import { useProfile, displayName, wakeWord } from '../lib/profile'
+import { useVoiceInputMode } from '../lib/voice-input-mode'
 
 const statusText: Record<Phase, string> = {
   offline: 'OFFLINE',
@@ -28,30 +31,56 @@ function Corner({ at }: { at: 'tl' | 'tr' | 'bl' | 'br' }) {
 
 /* --------------------------------------------------------------------- hud */
 
-export function Hud({ onPause, onResume }: { onPause: () => void; onResume: () => void }) {
+type HudProps = {
+  onPause: () => void
+  onResume: () => void
+  onToggleMicrophone: () => void
+  onToggleStandby?: () => void
+  onSubmitTranscript?: () => void
+  onSendMessage?: (text: string) => boolean | Promise<boolean>
+  onReplay?: (text: string) => void
+  chatId?: string
+  composerScope?: number
+}
+
+export function Hud({ onPause, onResume, onToggleMicrophone, onToggleStandby, onSubmitTranscript, onSendMessage, onReplay, chatId, composerScope }: HudProps) {
   const profile = useProfile()
+  const inputMode = useVoiceInputMode()
   const log = useRef<HTMLDivElement>(null)
+  const content = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
+  const previous = useRef<{ chatId?: string; ids: string[] }>({ chatId, ids: [] })
+  const [chatMinimized, setChatMinimized] = useState(false)
+  const savedScroll = useRef(0)
+  const wasMinimized = useRef(false)
+  const [showLatest, setShowLatest] = useState(false)
   const phase = useStore((s) => s.phase)
   const conversationPaused = useStore((s) => s.conversationPaused)
+  const microphoneMuted = useStore((s) => s.microphoneMuted)
+  const microphoneActive = useStore((s) => s.microphoneActive)
+  const microphoneStandby = useStore((s) => s.microphoneStandby)
+  const microphoneBusy = useStore((s) => s.microphoneBusy)
   const caption = useStore((s) => s.caption)
   const turns = useStore((s) => s.turns)
   const activeTool = useStore((s) => s.activeTool)
-  const connected = useStore((s) => s.connected)
   const error = useStore((s) => s.error)
-  const level = useStore((s) => s.level)
-  const voice = useStore((s) => s.voice)
   const bootNote = useStore((s) => s.bootNote)
   const gestures = useStore((s) => s.gestures)
   const looking = useStore((s) => s.looking)
   const screenCapture = useStore((s) => s.screenCapture)
   const recording = useStore((s) => s.recording)
   const ui = useStore((s) => s.ui)
+  const transcriptPending = inputMode === 'transcript' && phase === 'listening' && microphoneActive && !microphoneMuted && !microphoneStandby && !conversationPaused && !!caption.trim() && !!onSubmitTranscript
 
   // accentFor folds JARVIS's overrides in over the phase colour, so one
   // variable on the root carries a theme change into every .hud-* rule without
   // a single component knowing a theme exists.
   const colour = accentFor(phase, ui)
+  const answerBusy = ['thinking', 'tooling', 'speaking'].includes(phase)
+  const phaseStatus = phase === 'boot' && bootNote ? bootNote
+    : !microphoneActive && !answerBusy && phase !== 'boot' ? 'SOLO TEXTO' : statusText[phase]
+  const inputStatus = microphoneMuted ? 'MICRÓFONO APAGADO'
+    : microphoneActive && (microphoneStandby || conversationPaused) && phase !== 'boot' ? 'SOLO ACTIVACIÓN' : ''
 
   useEffect(() => {
     // The ground has to be set on the document, not painted here: the HUD sits
@@ -63,12 +92,38 @@ export function Hud({ onPause, onResume }: { onPause: () => void; onResume: () =
     else root.style.removeProperty('--bg')
   }, [ui.background])
 
+  useLayoutEffect(() => {
+    const ids = turns.map(turn => turn.id)
+    // Shared IDs distinguish streamed/appended turns (or history trimming) from
+    // a replacement session. chatId also covers conversations sharing a prefix.
+    const old = previous.current
+    const oldIds = new Set(old.ids)
+    const replaced = old.chatId !== chatId || (old.ids.length > 0 &&
+      (ids.length === 0 || !ids.some(id => oldIds.has(id))))
+    previous.current = { chatId, ids }
+    if (replaced) { follow.current = true; setShowLatest(false) }
+    if (!chatMinimized && log.current) {
+      if (follow.current) log.current.scrollTop = log.current.scrollHeight
+      else if (wasMinimized.current) log.current.scrollTop = savedScroll.current
+    }
+    wasMinimized.current = chatMinimized
+  }, [turns, chatId, ui.chrome.transcript, chatMinimized])
+
   useEffect(() => {
-    if (follow.current && log.current) log.current.scrollTop = log.current.scrollHeight
-  }, [turns])
+    const viewport = log.current
+    const body = content.current
+    if (chatMinimized || !viewport || !body || typeof ResizeObserver === 'undefined') return
+    // Wrapping, fonts and a resized window can change height without a new turn.
+    const observer = new ResizeObserver(() => {
+      if (follow.current) viewport.scrollTop = viewport.scrollHeight
+    })
+    observer.observe(viewport)
+    observer.observe(body)
+    return () => observer.disconnect()
+  }, [ui.chrome.transcript, chatMinimized])
 
   return (
-    <div className="hud" style={{ ['--accent' as string]: colour }}>
+    <div className="hud" data-microphone-muted={microphoneMuted} data-microphone-standby={microphoneStandby} data-transcript-pending={transcriptPending} style={{ ['--accent' as string]: colour }}>
       {/* First in the tree on purpose. Everything after it is positioned with
           `z-index: auto`, so paint order is document order and the sweep stays
           behind the transcript and the panels without a z-index war. */}
@@ -79,153 +134,133 @@ export function Hud({ onPause, onResume }: { onPause: () => void; onResume: () =
       <Corner at="bl" />
       <Corner at="br" />
 
-      <header className="hud-top">
-        {ui.chrome.brand && (
-          <div className="brand">
-            <span className="brand-mark">{displayName(profile)}</span>
-            <span className="brand-sub">{profile.configured ? 'Asistente personal' : 'Configuración inicial por conversación'}</span>
-          </div>
-        )}
+      <button type="button" className="surface-button chat-visibility-toggle" aria-controls="assistant-chat"
+        aria-expanded={!chatMinimized} onClick={(event) => {
+          if (!chatMinimized && log.current) savedScroll.current = log.current.scrollTop
+          setChatMinimized(!chatMinimized)
+          event.currentTarget.focus()
+        }}>{chatMinimized ? 'Mostrar chat' : 'Minimizar chat'}</button>
+      <section className="conversation-pane" data-minimized={chatMinimized} aria-label="Conversación con el asistente">
+        <div className="conversation-content" id="assistant-chat" hidden={chatMinimized}>
+          <header className="hud-top">
+            {ui.chrome.brand && (
+              <div className="brand">
+                <span className="brand-mark">{displayName(profile)}</span>
+                <span className="brand-sub">{profile.configured ? 'Asistente personal' : 'Configuración inicial por conversación'}</span>
+              </div>
+            )}
 
-        <div className="status">
-          <span className="dot" />
-          <span className="status-text">
-            {/* bootNote is the voice-model download readout. It is only ever
-                the right thing to show during boot — as a general fallback a
-                note that never got cleared (a stuck 'voice 97%') sits over
-                LISTENING and PROCESSING for the rest of the session. */}
-            {conversationPaused && phase !== 'offline' && phase !== 'boot' ? 'SOLO ACTIVACIÓN' : phase === 'boot' && bootNote ? bootNote : statusText[phase]}
-          </span>
-        </div>
-      </header>
-
-      {/* Left rail: which integrations are live */}
-      {ui.chrome.systems && (
-        <aside className="rail rail-left">
-          <div className="rail-title">SYSTEMS</div>
-          {connected.length === 0 && <div className="rail-item dim">none linked</div>}
-          {connected.map((c) => (
-            <div key={c} className="rail-item">
-              <span className="tick" />
-              {c}
+            <div className="status">
+              <span className="dot" />
+              <span className="status-text">
+                {/* bootNote is the voice-model download readout. It is only ever
+                    the right thing to show during boot — as a general fallback a
+                    note that never got cleared (a stuck 'voice 97%') sits over
+                    LISTENING and PROCESSING for the rest of the session. */}
+                {inputStatus ? `${inputStatus} · ${phaseStatus}` : phaseStatus}
+              </span>
             </div>
-          ))}
-          <div className="rail-item">
-            <span className="tick" />
-            Web
-          </div>
-        </aside>
-      )}
+          </header>
 
-      {/* Right rail: live telemetry, mostly for flavour */}
-      <aside className="rail rail-right">
-        <div className="rail-title">SIGNAL</div>
-        <div className="meter">
-          <div className="meter-fill" style={{ height: `${level * 100}%` }} />
-        </div>
-        <div className="rail-item mono">{(level * 100).toFixed(0).padStart(3, '0')}%</div>
-      </aside>
-
-      <AnimatePresence>
-        {activeTool && ui.chrome.toolBadge && (
-          <motion.div
-            className="tool-badge"
-            // Anchored to the TOP of the frame, not the middle. The old home was
-            // viewport-centre plus a fixed drop, which on a tall or square
-            // window landed the headline straight on top of the bottom
-            // transcript — two elements pinned to different edges of the screen
-            // were always going to meet somewhere. Up here it sits in its own
-            // band with the rest of the status chrome and can never collide with
-            // the log. Framer owns `transform` on an animated element, so the
-            // centring (x: -50%) lives in these props, not the stylesheet.
-            initial={{ opacity: 0, x: '-50%', y: -8, filter: 'blur(6px)' }}
-            animate={{ opacity: 1, x: '-50%', y: 0, filter: 'blur(0px)' }}
-            exit={{ opacity: 0, x: '-50%', y: -8, filter: 'blur(6px)' }}
-            transition={{ type: 'spring', stiffness: 300, damping: 26 }}
-          >
-            <span className="tool-kicker">
-              <span className="spinner" />
-              accessing
-            </span>
-            <span className="tool-name">{activeTool.replace(/[_-]/g, ' ')}</span>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* Conversation log — last few turns, fading upward */}
-      {ui.chrome.transcript && turns.length > 0 && (
-        <div className="log" ref={log} tabIndex={0} aria-label="Mensajes de la conversación"
-          onScroll={() => { const el = log.current; if (el) follow.current = el.scrollHeight - el.scrollTop - el.clientHeight < 56 }}>
-          <AnimatePresence initial={false}>
-            {turns.slice(-4).map((t) => (
+          <AnimatePresence>
+            {activeTool && ui.chrome.toolBadge && (
               <motion.div
-                key={t.id}
-                className={`log-line log-${t.role}`}
-                initial={{ opacity: 0, y: 14 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0 }}
-                transition={{ type: 'spring', stiffness: 320, damping: 32 }}
+                className="tool-badge"
+                initial={{ opacity: 0, y: -8, filter: 'blur(6px)' }}
+                animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
+                exit={{ opacity: 0, y: -8, filter: 'blur(6px)' }}
+                transition={{ type: 'spring', stiffness: 300, damping: 26 }}
               >
-                <span className="log-who">{t.role === 'user' ? 'TÚ' : displayName(profile)}</span>
-                <div className="log-text"><ResponseText text={t.text} /></div>
+                <span className="tool-kicker">
+                  <span className="spinner" />
+                  accessing
+                </span>
+                <span className="tool-name">{activeTool.replace(/[_-]/g, ' ')}</span>
               </motion.div>
-            ))}
+            )}
           </AnimatePresence>
+
+          <div className="chat-history">
+            {ui.chrome.transcript && <div className="log" ref={log} tabIndex={0} role="region" aria-label="Mensajes de la conversación"
+              onScroll={() => {
+                const el = log.current
+                if (!el || chatMinimized) return
+                follow.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 56
+                setShowLatest(!follow.current)
+              }}>
+              <div className="log-content" ref={content}>
+                {turns.length === 0 && <p className="chat-empty">Tu conversación aparecerá aquí.</p>}
+                {turns.map((t) => (
+                  <article key={t.id} className={`log-line log-${t.role}`}>
+                    <span className="log-who">{t.role === 'user' ? 'TÚ' : displayName(profile)}</span>
+                    <div className="log-text">
+                      <ResponseText text={t.text} />
+                      {t.role === 'jarvis' && t.text.trim() && onReplay && <button type="button" className="replay-message"
+                        aria-label="Volver a leer" disabled={answerBusy}
+                        onClick={() => onReplay(t.text)}>Volver a leer</button>}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </div>}
+            {ui.chrome.transcript && showLatest && <button type="button" className="surface-button jump-latest" onClick={() => {
+              follow.current = true
+              setShowLatest(false)
+              if (log.current) log.current.scrollTop = log.current.scrollHeight
+            }}>Ir al último mensaje ↓</button>}
+            {ui.chrome.suggestions && microphoneActive && !microphoneMuted && !microphoneStandby && <Suggestions />}
+          </div>
+
+          {onSendMessage && <MessageComposer key={composerScope} onSendMessage={onSendMessage} />}
         </div>
-      )}
 
-      <AnimatePresence>
-        {caption && (
-          <motion.div
-            className="caption"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-          >
-            {caption}
-          </motion.div>
-        )}
-      </AnimatePresence>
+        <div className="conversation-dock">
+          <AnimatePresence>
+            {caption && (
+              <motion.div
+                className="caption"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+              >
+                {caption}
+              </motion.div>
+            )}
+          </AnimatePresence>
 
-      {/* The one surface. Panels used to sit alongside this as a second place
-          for things to appear, which meant two places to look and a decision
-          the model had to make on grounds it could not know. Everything renders
-          here now; Panels.tsx is unmounted rather than deleted so the design
-          system it documents stays findable. */}
+          {error && <div className="error" role="alert">{error}</div>}
+
+          <footer className="hud-bottom">
+            {transcriptPending && <div className="transcript-submit">
+              <button type="button" className="surface-button" onClick={onSubmitTranscript}>
+                Enviar texto <kbd>Enter</kbd>
+              </button>
+            </div>}
+            <MicrophoneControl muted={microphoneMuted} busy={microphoneBusy || phase === 'boot'}
+              inactive={!microphoneActive || phase === 'boot'}
+              standby={microphoneStandby} name={wakeWord(profile)} onStandby={onToggleStandby}
+              historyActive={recording?.active !== false} onToggle={onToggleMicrophone} />
+            <ListeningControl paused={conversationPaused} muted={microphoneMuted || !microphoneActive} standby={microphoneStandby}
+              disabled={phase === 'offline' || phase === 'boot' || microphoneMuted && conversationPaused}
+              name={wakeWord(profile)} onPause={onPause} onResume={onResume} />
+            {recording && (
+              <button type="button" aria-pressed={recording.active}
+                disabled={(microphoneMuted || microphoneStandby) && !recording.active}
+                style={{ pointerEvents: 'auto', color: 'inherit', background: 'transparent', border: '1px solid currentColor', padding: '6px 10px', cursor: 'pointer', font: 'inherit' }}
+                onClick={() => { void setRecordingActive(!recording.active).catch((err: Error) => useStore.getState().setError(err.message)) }}
+                title={recording.error || 'Capturas + micrófono + sonido del PC. Se conservan los últimos 30 minutos.'}>
+                {recording.error ? '⚠ ' : recording.active ? '● ' : ''}
+                {recording.active ? 'Historial activo · Pausar' : 'Historial pausado · Reanudar'}
+                {recording.error && ` · ${recording.error}`}
+              </button>
+            )}
+            {screenCapture !== 'off' && <span className="capture-status" role="status">{screenCapture === 'capturing'
+              ? 'Capturando monitor…' : screenCapture === 'attached' ? 'Captura adjunta' : 'Sin captura del monitor'}</span>}
+          </footer>
+        </div>
+      </section>
+
       <Blades />
-
-      {ui.chrome.suggestions && <Suggestions />}
-
-      {error && <div className="error">{error}</div>}
-
-      <footer className="hud-bottom">
-        <ListeningControl paused={conversationPaused} disabled={phase === 'offline' || phase === 'boot'}
-          name={wakeWord(profile)} onPause={onPause} onResume={onResume} />
-        {recording && (
-          <button type="button" aria-pressed={recording.active}
-            style={{ pointerEvents: 'auto', color: 'inherit', background: 'transparent', border: '1px solid currentColor', padding: '6px 10px', cursor: 'pointer', font: 'inherit' }}
-            onClick={() => { void setRecordingActive(!recording.active).catch((err: Error) => useStore.getState().setError(err.message)) }}
-            title={recording.error || 'Capturas + micrófono + sonido del PC. Se conservan los últimos 30 minutos.'}>
-            {recording.error ? '⚠ ' : recording.active ? '● ' : ''}
-            {recording.active ? `REC · ${recording.fps.toFixed(1)} fps · mic + PC · Pausar` : 'Historial pausado · Reanudar'}
-            {recording.error && ` · ${recording.error}`}
-          </button>
-        )}
-        <span className="hint">
-          di <b>“hola, {wakeWord(profile)}”</b> · <kbd>Space</kbd> para hablar · <kbd>G</kbd> manos
-          {screenCapture !== 'off' && (
-            <span role="status">{' · '}{screenCapture === 'capturing'
-              ? 'Capturando monitor…'
-              : screenCapture === 'attached' ? 'Captura del monitor adjunta' : 'Sin captura del monitor'}</span>
-          )}
-          {voice && (
-            <>
-              {' · '}
-              <kbd>V</kbd> voice: {voice.replace(/\(.*?\)/g, '').trim()}
-            </>
-          )}
-        </span>
-      </footer>
 
       {/* Last, so a flash or a tear reads as being on the glass rather than
           underneath the chrome. It is pointer-events: none and unmounts the

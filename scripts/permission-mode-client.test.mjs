@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 import vm from 'node:vm'
+import { timingStub } from './timing-fixture.mjs'
 
 const source = ts.transpileModule(readFileSync(new URL('../src/lib/bridge.ts', import.meta.url), 'utf8'), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
@@ -26,7 +27,9 @@ async function setup() {
     setTimeout: (fn, ms) => { const id = ++sequence; timers.set(id, { fn, ms }); return id },
     clearTimeout: id => timers.delete(id),
     localStorage: { getItem: () => null, setItem: (...args) => writes.push(args) },
-    require: id => id === './models' ? {} : id === '../config' ? { BRIDGE_WS_URL: 'ws://127.0.0.1:8787' }
+    require: id => id === './utterance-audio' ? { captureDiagnostics: () => ({ status: 'missing', durationMs: 0 }) }
+      : id === './timings' ? timingStub() : id === './projects' ? { selectedProject: () => null, subscribeProjects: () => () => {} }
+      : id === './models' ? {} : id === '../config' ? { BRIDGE_WS_URL: 'ws://127.0.0.1:8787' }
       : { useStore: { setState() {}, getState: () => ({}) } },
   })
   const warming = exports.warmBridge()
@@ -61,4 +64,29 @@ test('unacknowledged escalation closes the connection instead of leaving an unce
   assert.equal(app.permissionModeSnapshot().mode, 'manual')
   assert.equal(app.permissionModeSnapshot().connected, false)
   assert.equal(app.permissionModeSnapshot().pending, false)
+})
+
+test('native questions retain their pending UI until reply confirmation, and status errors allow explicit retry', async () => {
+  const { app, ws } = await setup()
+  const request = { id: 'codex:runtime:thread:number:1', permission: 'user_input', patterns: [], metadata: { questions: [] } }
+  ws.emit({ type: 'permissions', requests: [request] })
+  const failed = app.replyUserInput(request.id, { q: { answers: ['respuesta'] } })
+  assert.equal(ws.sent.at(-1).type, 'user_input')
+  const rejected = assert.rejects(failed, /Solicitud inválida/)
+  ws.emit({ type: 'status_error', ask: request.id, message: 'Solicitud inválida' })
+  await rejected
+  let settled = false
+  const retry = app.replyUserInput(request.id, {}).then(() => { settled = true })
+  await Promise.resolve(); assert.equal(settled, false)
+  ws.emit({ type: 'permissions', requests: [] })
+  await retry; assert.equal(settled, true)
+  await assert.rejects(app.replyUserInput(request.id, {}), /venció|otra conversación/)
+})
+
+test('native permission replies reject on connection loss rather than leaving a disabled modal forever', async () => {
+  const { app, ws } = await setup()
+  ws.emit({ type: 'permissions', requests: [{ id: 'approval', permission: 'bash', patterns: [], metadata: {} }] })
+  const decision = app.replyPermission('approval', 'reject')
+  const rejected = assert.rejects(decision, /conexión cambió/)
+  ws.close(); await rejected
 })

@@ -30,8 +30,8 @@ file path. Show it on the display (file:///path) when that helps.
 
 monitor:
   all        — both monitors in one image (default)
-  principal  — the main active monitor resolved by the desktop backend
-  secundario — the other active monitor, when available
+  principal  — the main monitor (LG UltraGear, 1920x1080)
+  secundario — the secondary monitor (LG HD, 1600x900)
 
 Use it when the user asks you to look at their screen, a window, an error, "what
 do I have open". Not speculatively: it sends what is on their screen to you.`

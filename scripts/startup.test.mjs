@@ -6,12 +6,14 @@ import ts from 'typescript'
 
 const text = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8')
 const source = ts.createSourceFile('App.tsx', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
-let ignite
+let ignite, startCapture, configureClient
 const jsxTags = []
 function visit(node) {
   if (ts.isVariableDeclaration(node) && node.name.getText(source) === 'ignite') {
     ignite = node.initializer
   }
+  if (ts.isVariableDeclaration(node) && node.name.getText(source) === 'configureClient') configureClient = node.initializer
+  if (ts.isVariableDeclaration(node) && node.name.getText(source) === 'startCapture') startCapture = node.initializer
   if (ts.isJsxSelfClosingElement(node) || ts.isJsxOpeningElement(node)) {
     jsxTags.push(node.tagName.getText(source))
   }
@@ -33,6 +35,7 @@ for (const configured of [true, false]) test(`startup initializes without intro;
   const warming = new Promise(resolve => { finishWarm = resolve })
   const warmingStarted = new Promise(resolve => { markWarming = resolve })
   const state = {
+    setMicrophoneActive: () => {},
     setPhase: value => { phase = value; events.push(value) },
     setConnected: () => events.push('connected'),
     setVoice: () => events.push('voice'),
@@ -54,17 +57,16 @@ for (const configured of [true, false]) test(`startup initializes without intro;
     createSpeaker: () => ({ say: () => events.push('say'), end: async () => {} }),
     listen: delay => { assert.equal(delay, 60000); events.push('listen') },
     connectedLabels: () => [], currentVoiceName: () => 'browser voice',
-    startAnalyser: async () => { events.push('analyser') },
     probeCapabilities: async () => { events.push('capabilities') },
-    startVoice: async () => { events.push('microphone'); return {} },
+    createMicrophone: () => ({ start: async () => { events.push('microphone'); return true } }),
     voice: { current: null },
     setTimeout: () => assert.fail('artificial startup delay'),
     setInterval: () => assert.fail('unexpected browser-voice polling'),
   }
   for (const name of ['watchServers', 'watchRecording', 'watchPermissions', 'watchPanels',
     'watchBlades', 'watchCapture', 'watchUi', 'watchConnection', 'mode', 'onWake',
-    'onSpeechStart', 'onPartial', 'onUtterance', 'onVoiceError']) context[name] = () => {}
-  const code = ts.transpileModule(`(${ignite.getText(source)})`, {
+    'onSpeechStart', 'onPartial', 'onUtterance', 'onClip', 'onVoiceError']) context[name] = () => {}
+  const code = ts.transpileModule(`const configureClient = ${configureClient.getText(source)}; const startCapture = ${startCapture.getText(source)}; (${ignite.getText(source)})`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
   }).outputText
   const start = vm.runInNewContext(code, context)
@@ -77,5 +79,5 @@ for (const configured of [true, false]) test(`startup initializes without intro;
   assert.equal(phase, 'dormant')
   assert.ok(context.voice.current)
   assert.deepEqual(events, ['unlock', 'enable', 'boot', 'warm', 'connected', 'voice',
-    'analyser', 'capabilities', 'microphone', 'dormant', ...(configured ? [] : ['welcome', 'say', 'listen'])])
+    'capabilities', 'microphone', 'dormant', ...(configured ? [] : ['welcome', 'say', 'listen'])])
 })
