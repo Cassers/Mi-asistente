@@ -575,6 +575,9 @@ export function ask(
   options?: { audioMode?: 'transcript' },
 ): Promise<TurnResult> {
   const audioMode = options?.audioMode || currentVoiceInputMode()
+  if (selectedProject()?.application === 'codex' && (audio || audioMode !== 'transcript')) {
+    return Promise.reject(new Error('Codex usa solo dictado del navegador. No se envió el clip ni se convirtió su subtítulo en un mensaje.'))
+  }
   if (audioMode !== 'direct') {
     if (!directClips.size) return askTurn(prompt, handlers, audio, traceId, audioMode)
     const scope = directScope
@@ -850,6 +853,9 @@ async function askTurn(
     arm()
 
     try {
+      if (servers.includes('codex') && (audio || audioMode !== 'transcript')) {
+        throw new Error('Codex usa solo dictado del navegador. No se envió el clip ni su subtítulo.')
+      }
       if (direct) {
         if (!validDirect(direct) || socket !== ws) { finish('', 'detached'); return }
         direct.sent = true; direct.submittedPreserveOnly = direct.preserveOnly

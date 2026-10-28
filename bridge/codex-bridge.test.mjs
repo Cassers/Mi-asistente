@@ -63,7 +63,7 @@ test('WS input cancellation answers native id; archive is recoverable and hard a
   const f = await fixture(t), { socket, state } = await connect(f)
   socket.message({ type: 'ask', id: 'direct', text: 'audio', audioMode: 'direct', audio: { mime: 'audio/wav', data: 'bad' } })
   await flush()
-  assert.match(socket.frames.find(frame => frame.type === 'error').message, /Solo transcripción/)
+  assert.match(socket.frames.find(frame => frame.type === 'error').message, /solo dictado/)
   f.rpc.server('item/tool/requestUserInput', 91, { threadId: state.id, turnId: 'native-turn', itemId: 'question', questions: [{ id: 'q' }] })
   await flush()
   socket.message({ type: 'user_input', id: [...state.ordinary.keys()][0], answers: {} })
@@ -82,4 +82,17 @@ test('WS input cancellation answers native id; archive is recoverable and hard a
   assert.match(socket.frames.find(frame => frame.type === 'error').message, /catálogo/)
   assert.equal(socket.frames.some(frame => frame.type === 'done'), false)
   assert.equal(f.rpc.calls.some(call => call.method === 'turn/start'), false)
+})
+
+test('Codex boundary advertises transcript-only and rejects direct, preserveOnly and attached-audio bypasses', async t => {
+  const f = await fixture(t), { socket } = await connect(f)
+  const ready = socket.frames.find(frame => frame.type === 'ready')
+  assert.equal(ready.capabilities.directAudio, false); assert.equal(ready.capabilities.transcriptOnly, true)
+  for (const patch of [{ audioMode: 'direct' }, { preserveOnly: true }, { audioMode: 'transcript', audio: { mime: 'audio/wav', data: 'old-prefix' } }]) {
+    socket.message({ type: 'ask', id: 'blocked', text: 'old caption', ...patch }); await flush()
+  }
+  assert.equal(f.rpc.calls.some(call => ['thread/inject_items', 'turn/start'].includes(call.method)), false)
+  assert.equal(socket.frames.filter(frame => frame.type === 'error').length, 3)
+  socket.message({ type: 'ask', id: 'text', text: 'Fresh intentional text', audioMode: 'transcript' }); await flush()
+  assert.equal(f.rpc.calls.filter(call => call.method === 'turn/start').length, 1)
 })

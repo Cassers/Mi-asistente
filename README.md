@@ -76,7 +76,8 @@ Consulta [proyectos nativos](docs/project-client.md),
 [mediciones](docs/performance.md) y [flujo de voz](docs/voice-flow-review-2026-10-26.md).
 Los modelos, permisos, herramientas y modalidades siguen limitados por cada cliente
 nativo y su proveedor. El reconocimiento del navegador puede enviar voz a su
-servicio. Codex no garantiza admitir los mismos clips que OpenCode.
+servicio. Codex usa solo dictado del navegador y envía texto; audio directo está
+deshabilitado. OpenCode conserva su elección de audio directo o transcripción.
 
 ## Configuración local y datos
 

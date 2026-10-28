@@ -101,7 +101,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/profile') return json(200, await publicProfile(project))
     if (req.method === 'GET' && url.pathname === '/models') {
       if (!project) return json(200, { models: [nativeDefault], defaultModel: nativeDefault.id })
-      if (project.application === 'codex') return json(200, { models: [{ ...nativeDefault, provider: 'Codex', audioReason: 'Puedes hablar mediante el dictado del navegador; los clips directos todavía no están habilitados para Codex.' }, ...await codex.models(project.directory)], defaultModel: nativeDefault.id })
+      if (project.application === 'codex') return json(200, { models: [{ ...nativeDefault, provider: 'Codex', audioReason: 'Codex usa solo dictado del navegador en este cliente; el audio directo está deshabilitado.' }, ...await codex.models(project.directory)], defaultModel: nativeDefault.id })
       return json(200, { models: [nativeDefault, ...availableModels(await projects.api(project)('GET', '/provider'))], defaultModel: nativeDefault.id })
     }
     return json(404, { error: 'Ruta no disponible.' })

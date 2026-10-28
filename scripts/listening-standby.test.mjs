@@ -18,7 +18,9 @@ function visit(node) {
   ts.forEachChild(node, visit)
 }
 visit(source)
-function harness(configured = true) {
+function harness(configured = true, capturedClip) {
+  const responseInputs = []
+  let consumed = 0
   const events = [], questions = []
   const state = { phase: 'speaking', conversationPaused: false, microphoneMuted: false, microphoneActive: true, microphoneStandby: false, microphoneBusy: false, caption: 'old partial', activeTool: 'read', screenCapture: 'attached' }
   for (const [method, property] of [['setPhase','phase'],['setConversationPaused','conversationPaused'],['setCaption','caption'],['setActiveTool','activeTool'],['setScreenCapture','screenCapture'],['setMicrophoneMuted','microphoneMuted'],['setMicrophoneActive','microphoneActive'],['setMicrophoneStandby','microphoneStandby'],['setMicrophoneBusy','microphoneBusy'],['setLevel','level']]) state[method] = value => { state[property] = value }
@@ -27,8 +29,8 @@ function harness(configured = true) {
   const context = { currentVoiceInputMode: () => state.inputMode || 'transcript', followup: { current: false }, activeTurnTiming: { current: null }, ...voiceTimingStub(), store: { getState: () => state }, turn: { current: 10 }, clearIdle: () => events.push('clearIdle'),
     silence: () => events.push('cancelSpeech'), interrupt: () => events.push('interruptBackend'), music: { working() {}, duck() {} },
     sfx: { play() {}, duck() {} }, currentProfile: () => profile, listeningMode: policy.listeningMode, wakePattern,
-    respond: said => questions.push(said), listen: () => { state.phase = 'listening' }, AWAIT_SPEECH_MS: 14000,
-    markUtteranceAudio: () => events.push('markVoiceClip'), takeUtteranceAudio: () => undefined,
+    respond: (...args) => { responseInputs.push(args); questions.push(args[0]) }, listen: () => { state.phase = 'listening' }, AWAIT_SPEECH_MS: 14000,
+    markUtteranceAudio: () => events.push('markVoiceClip'), takeUtteranceAudio: () => { consumed++; return capturedClip },
     resetUtteranceAudio: () => events.push('discardVoiceClip'),
     speaker: { current: null }, createSpeaker: () => ({ say() {}, end: async () => {} }), attention: () => '',
     voice: { current: { commit: () => { events.push('commitPending'); return true }, reset: () => events.push('clearRecognition'), stop: () => events.push('stopCapture'), start: async () => { events.push('startCapture'); return true } } },
@@ -38,7 +40,7 @@ function harness(configured = true) {
   }
   const code = [...declarations].map(([name, value]) => `const ${name} = ${value};`).join('\n') + `\nglobalThis.handlers = {${[...needed].join(',')}};`
   vm.runInNewContext(compile(code), context)
-  return { ...context, ...context.handlers, state, events, questions }
+  return { ...context, ...context.handlers, state, events, questions, responseInputs, consumed: () => consumed }
 }
 
 test('explicit standby stays wake-only even before first-chat configuration; offline stays deaf', () => {
@@ -210,4 +212,19 @@ test('direct name-only activation preserves PCM and playback for a delayed quest
   app.onWake('')
   assert.equal(app.state.microphoneStandby, false); assert.equal(app.state.phase, 'speaking')
   assert.ok(!app.events.includes('clearRecognition')); assert.ok(!app.events.includes('cancelSpeech'))
+})
+
+test('Codex transcript wake-name plus question consumes available PCM and forwards only fresh recognized text', () => {
+  const app = harness(true, { mime: 'audio/wav', data: 'captured-wake-pcm' })
+  app.state.phase = 'dormant'; app.state.inputMode = 'transcript'; app.state.microphoneStandby = true
+  const words = 'hola Diógenes explica las funciones'
+  const match = wakePattern({ ...DEFAULT_PROFILE, name: 'Diógenes' }, 'greeting').exec(words)
+  const trailing = words.slice(match.index + match[0].length).trim()
+  app.onWake(trailing, 'wake-trace')
+  assert.equal(app.consumed(), 1)
+  assert.equal(app.responseInputs.length, 1)
+  assert.equal(app.responseInputs[0][0], 'explica las funciones')
+  assert.equal(app.responseInputs[0][1], undefined)
+  assert.equal(app.responseInputs[0][2], 'wake-trace')
+  assert.equal(app.state.microphoneStandby, false)
 })

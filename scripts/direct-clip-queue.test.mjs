@@ -7,8 +7,8 @@ import { timingStub } from './timing-fixture.mjs'
 const flush = async () => { for (let i = 0; i < 40; i++) await Promise.resolve() }
 const deferred = () => { let resolve; const promise = new Promise(yes => { resolve = yes }); return { promise, resolve } }
 
-async function fixture({ select, connected = true } = {}) {
-  let project = { id: 'p1' }, mode = 'direct', model = 'native/default', timer = 0
+async function fixture({ select, connected = true, application = 'opencode' } = {}) {
+  let project = { id: 'p1', application }, mode = 'direct', model = 'native/default', timer = 0
   const watchers = new Set(), sockets = [], statuses = [], text = [], queueSpans = [], storage = new Map()
   class Socket {
     static OPEN = 1; static CLOSED = 3
@@ -18,7 +18,7 @@ async function fixture({ select, connected = true } = {}) {
     removeEventListener(type, fn) { this.listeners.get(type)?.delete(fn) }
     send(raw) { this.sent.push(JSON.parse(raw)) }
     emit(message) { for (const fn of [...(this.listeners.get('message') || [])]) fn({ data: JSON.stringify(message) }) }
-    open(chat = 'c1') { this.readyState = 1; this.onopen(); this.emit({ type: 'ready', servers: ['opencode'], conversation: { id: chat, turns: [], entries: [], title: 'fixture' } }) }
+    open(chat = 'c1') { this.readyState = 1; this.onopen(); this.emit({ type: 'ready', servers: [project.application], conversation: { id: chat, turns: [], entries: [], title: 'fixture' } }) }
     close() { this.readyState = 3; this.onclose?.(); for (const fn of [...(this.listeners.get('close') || [])]) fn({}) }
   }
   const timings = timingStub()
@@ -28,7 +28,7 @@ async function fixture({ select, connected = true } = {}) {
     '../store': { useStore: { setState() {}, getState: () => ({}) } },
     './projects': { selectedProject: () => project, subscribeProjects: fn => { watchers.add(fn); return () => watchers.delete(fn) } },
     './models': { currentModelSelection: () => select ? select() : Promise.resolve(model === 'native/default' ? {} : { model, variant: 'high' }) },
-    './voice-input-mode': { currentVoiceInputMode: () => mode, reportVoiceInput: value => statuses.push(value) },
+    './voice-input-mode': { currentVoiceInputMode: () => project.application === 'codex' ? 'transcript' : mode, reportVoiceInput: value => statuses.push(value) },
     './utterance-audio': { captureDiagnostics: () => ({ status: 'ready', durationMs: 6000 }) },
     './timings': { ...timings, startTiming(name, traceId) { const span = timings.startTiming(name, traceId); if (name !== 'audio.queue') return span
       const row = { traceId }; queueSpans.push(row); return { ...span, end(status = 'ok') { row.status ??= status } } } },
@@ -48,7 +48,7 @@ async function fixture({ select, connected = true } = {}) {
     ack(ws = sockets.at(-1)) { const stop = ws.sent.filter(frame => frame.type === 'interrupt').at(-1); assert.ok(stop); ws.emit({ type: 'interrupted', requestID: stop.requestID, status: 'ok' }); return stop },
     done(frame, ws = sockets.at(-1)) { ws.emit({ type: 'done', ask: frame.id, text: frame.preserveOnly ? '' : 'answer', status: frame.preserveOnly ? 'cancelled' : 'ok' }) },
     setMode(value) { mode = value }, setModel(value) { model = value },
-    setProject(id) { project = { id }; for (const fn of watchers) fn() },
+    setProject(id, application = project.application) { project = { id, application }; for (const fn of watchers) fn() },
   }
 }
 
@@ -162,4 +162,26 @@ test('three clips also preserve a held second selection after the first native s
   const third = f.frames()[2]; assert.equal(third.audio.data, 'three'); assert.equal(third.preserveOnly, undefined)
   f.done(third); assert.equal((await one).status, 'cancelled'); assert.equal((await two).status, 'cancelled'); assert.equal((await three).status, 'ok')
   assert.deepEqual(f.frames().map(frame => frame.audio.data), ['one', 'two', 'three'])
+})
+
+test('Codex client rejects old direct clips and explicit audio overrides without sending their captions', async () => {
+  const f = await fixture({ application: 'codex' })
+  await assert.rejects(f.ask('old-audio-caption'), /solo dictado/)
+  await assert.rejects(f.app.ask('old-audio-caption', { onText() {}, onTool() {} }, undefined, 'trace', { audioMode: 'direct' }), /solo dictado/)
+  assert.equal(f.frames().length, 0)
+  const text = f.app.ask('Fresh browser dictation', { onText() {}, onTool() {} }); await flush()
+  assert.equal(f.frames()[0].audioMode, 'transcript'); assert.equal(f.frames()[0].audio, undefined)
+  assert.equal(f.frames()[0].text, 'Fresh browser dictation'); f.done(f.frames()[0]); await text
+})
+
+test('switching to Codex detaches unsent OpenCode audio and sends only fresh dictation', async () => {
+  const choice = deferred(), f = await fixture({ select: () => choice.promise })
+  const old = f.ask('old-prefix'); await flush()
+  f.setProject('codex-project', 'codex'); await flush(); f.ws.open('codex-chat'); await flush()
+  choice.resolve({}); await flush(); assert.equal((await old).status, 'detached')
+  assert.equal(f.frames().length, 0)
+  const text = f.app.ask('New dictated words', { onText() {}, onTool() {} }); await flush()
+  assert.equal(f.frames().length, 1); assert.equal(f.frames()[0].text, 'New dictated words')
+  assert.equal(f.frames()[0].audioMode, 'transcript'); assert.equal(f.frames()[0].audio, undefined)
+  f.done(f.frames()[0]); await text
 })

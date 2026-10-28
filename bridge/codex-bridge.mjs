@@ -15,9 +15,12 @@ export async function attachCodexClient(socket, { project, manager, recorder, ti
     try { msg = JSON.parse(raw.toString()) } catch { return }
     if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return
     try {
-      if (msg.type === 'ask') await runtime.ask(state, msg, timing)
+      if (msg.type === 'ask') {
+        if (msg.audio || msg.preserveOnly || msg.audioMode && msg.audioMode !== 'transcript') throw new Error('Codex usa solo dictado del navegador. El audio directo está deshabilitado; no se envió el clip.')
+        await runtime.ask(state, { ...msg, audioMode: 'transcript' }, timing)
+      }
       else if (msg.type === 'interrupt') {
-        await runtime.interrupt(state, timing)
+        await runtime.interrupt(state, timing, msg.reason)
         send({ type: 'interrupted', requestID: msg.requestID, status: 'ok' })
       } else if (msg.type === 'session_list') send({ type: 'session_list', entries: await runtime.list() })
       else if (msg.type === 'session_delete' && msg.id === state.id) {
@@ -50,7 +53,7 @@ export async function attachCodexClient(socket, { project, manager, recorder, ti
     if (gone) { unsubscribe(); return }
     send({ type: 'ready', servers: ['codex', project.name], application: 'codex', native: true,
       conversation: { id: state.id, title: state.title, resumed: !!choice && choice !== 'new', entries, turns: runtime.transcript(state), busy: runtime.snapshot(state).busy },
-      capabilities: { archive: true, recoverableArchive: true, directAudio: false, userInput: true } })
+      capabilities: { archive: true, recoverableArchive: true, directAudio: false, transcriptOnly: true, userInput: true } })
     ready = true
     for (const frame of staged) send(frame)
     send(runtime.snapshot(state)); runtime.publishPermissions(state)

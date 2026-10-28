@@ -12,7 +12,7 @@ function pureModule(name) {
   const exports = {}
   vm.runInNewContext(ts.transpileModule(readFileSync(new URL(`../src/lib/${name}.ts`, import.meta.url), 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
-  }).outputText, { exports, require })
+  }).outputText, { exports, require: id => id === './projects' ? { selectedProject: () => null, subscribeProjects: () => () => {} } : require(id) })
   return exports
 }
 function component(file, name) {
@@ -254,4 +254,28 @@ test('native Codex questions render escaped prompts, secret password fields and 
   assert.doesNotMatch(html, /<script>|Autorizar solo esta vez/)
   assert.match(html, /Cancelar solicitud/); assert.match(html, /Enviar respuestas/)
   assert.match(html, /Escribir otra respuesta/)
+})
+
+test('Codex voice selector forces browser transcription and disables direct without changing OpenCode', () => {
+  const html = render(VoiceInput, { application: 'codex' })
+  assert.match(html, /<option value="direct" disabled=""/)
+  assert.match(html, /value="transcript" selected=""/)
+  assert.match(html, /Codex usa solo el dictado del navegador/)
+  assert.match(html, /elección de OpenCode se conserva/)
+  const open = render(VoiceInput, { application: 'opencode' })
+  assert.match(open, /value="direct" selected=""/)
+  assert.doesNotMatch(open, /<option value="direct" disabled/)
+})
+
+test('Codex voice policy stays transcription-only for compatible, unsupported and native-default models', () => {
+  const props = { application: 'codex', variant: '', locked: false, loading: false, error: '', onChoose() {}, onRefresh() {} }
+  for (const option of [
+    { id: 'audio', audio: true }, { id: 'text', audio: false }, { id: 'native/default', audio: false },
+  ]) {
+    const model = { ...option, name: 'Fixture', provider: 'Codex', image: true, variants: [] }
+    const html = render(Picker, { ...props, models: [model], model: model.id })
+    assert.match(html, /Codex usa solo el dictado del navegador/)
+    assert.match(html, /Audio directo deshabilitado/)
+    assert.doesNotMatch(html, /Audio directo: cada pausa/)
+  }
 })

@@ -235,7 +235,10 @@ export default function App() {
   // -- one turn -------------------------------------------------------------
 
   const respond = async (said: string, clip?: VoiceClip, traceId: string | undefined = timingTrace(), inputKind: 'voice' | 'text' = 'voice', acknowledge?: (accepted: boolean) => void): Promise<void> => {
-    if (inputKind === 'voice' && !clip) clip = takeUtteranceAudio()
+    if (inputKind === 'voice' && !clip) {
+      const captured = takeUtteranceAudio()
+      if (currentVoiceInputMode() !== 'transcript') clip = captured
+    }
     const directAudio = !!clip && currentVoiceInputMode() === 'direct'
     if (inputKind === 'voice') {
       const captured = captureDiagnostics()
@@ -423,7 +426,8 @@ export default function App() {
       return
     }
     if (trailing) markUtteranceAudio()
-    const wakeClip = trailing ? takeUtteranceAudio() : undefined
+    const capturedWakeClip = trailing ? takeUtteranceAudio() : undefined
+    const wakeClip = currentVoiceInputMode() === 'transcript' ? undefined : capturedWakeClip
     store.getState().setConversationPaused(false)
     voice.current?.reset?.()
     store.getState().setError(null)

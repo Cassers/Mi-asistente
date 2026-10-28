@@ -174,3 +174,57 @@ test('explicit transcript owner requests browserOnly even if a cloud recognizer 
   assert.equal(await mic.start(), true); assert.equal(options[0].browserOnly, true)
   assert.equal(mic.commit(), true); mic.stop()
 })
+
+test('effective Codex application mode restarts live capture, blocks stale clips and restores OpenCode direct input', async () => {
+  let application = 'opencode'
+  const watchers = new Set(), loops = [], heard = [], clips = [], storage = new Map()
+  const modes = load('voice-input-mode', {
+    react: { useSyncExternalStore: (_, read) => read() },
+    './projects': { selectedProject: () => ({ application }), subscribeProjects: fn => { watchers.add(fn); return () => watchers.delete(fn) } },
+  }, { localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value) } })
+  const driver = (kind, h, options) => {
+    const loop = { kind, h, options, stopped: false, live: () => true, stop() { this.stopped = true } }
+    loops.push(loop); return loop
+  }
+  const { createMicrophone } = load('microphone', {
+    './voice-input-mode': modes,
+    './audio': { getMic: async () => ({}), startAnalyser: async () => {}, setMicBlocked() {} },
+    './direct-voice': { startDirectVoice: async h => driver('direct', h) },
+    './voice': { startVoice: async (h, options) => driver('transcript', h, options) },
+  })
+  const mic = createMicrophone({ mode: () => 'command', onUtterance: text => heard.push(text), onClip: clip => clips.push(clip), onError: assert.fail })
+  assert.equal(await mic.start(), true); assert.equal(loops[0].kind, 'direct')
+  application = 'codex'; for (const fn of watchers) fn()
+  loops[0].h.onClip({ data: 'late prefix' }); loops[0].h.onUtterance('old caption')
+  for (let i = 0; i < 24; i++) await Promise.resolve()
+  assert.equal(loops[0].stopped, true); assert.equal(loops[1].kind, 'transcript'); assert.equal(loops[1].options.browserOnly, true)
+  loops[1].h.onUtterance('Fresh browser dictation'); assert.deepEqual(heard, ['Fresh browser dictation']); assert.deepEqual(clips, [])
+  application = 'opencode'; for (const fn of watchers) fn()
+  for (let i = 0; i < 24; i++) await Promise.resolve()
+  assert.equal(loops[1].stopped, true); assert.equal(loops[2].kind, 'direct')
+  mic.stop()
+})
+
+test('Codex switch during pending direct startup invalidates the driver immediately and forwards restart success', async () => {
+  let application = 'opencode', finishDirect
+  const watchers = new Set(), clips = [], modes = load('voice-input-mode', {
+    react: { useSyncExternalStore: (_, read) => read() },
+    './projects': { selectedProject: () => ({ application }), subscribeProjects: fn => { watchers.add(fn); return () => watchers.delete(fn) } },
+  }, { localStorage: { getItem: () => 'direct', setItem() {} } })
+  let old, browserOnly
+  const { createMicrophone } = load('microphone', {
+    './voice-input-mode': modes,
+    './audio': { getMic: async () => ({}), startAnalyser: async () => {}, setMicBlocked() {} },
+    './direct-voice': { startDirectVoice: h => new Promise(resolve => {
+      old = { h, stopped: false, live: () => true, stop() { this.stopped = true } }; finishDirect = () => resolve(old)
+    }) },
+    './voice': { startVoice: async (_h, options) => { browserOnly = options.browserOnly; return { live: () => true, stop() {} } } },
+  })
+  const mic = createMicrophone({ mode: () => 'command', onClip: x => clips.push(x), onError: assert.fail })
+  const starting = mic.start(); for (let i = 0; i < 20; i++) await Promise.resolve()
+  application = 'codex'; for (const fn of watchers) fn()
+  old.h.onClip({ data: 'stale' }); assert.equal(old.h.mode(), 'deaf')
+  finishDirect(); assert.equal(await starting, true)
+  assert.equal(old.stopped, true); assert.equal(browserOnly, true); assert.deepEqual(clips, [])
+  mic.stop()
+})
