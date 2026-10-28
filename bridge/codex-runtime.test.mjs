@@ -93,7 +93,7 @@ test('manager caches canonical cwd, verifies metadata without turns/secrets and 
   assert.deepEqual(models.map(m => m.id), ['codex-text','codex-image'])
   assert.deepEqual(models[0].variants, ['medium','ultra'])
   assert.deepEqual(models[0].cost, { input: null, output: null })
-  assert.equal(models[1].image, true); assert.equal(models[1].audio, false)
+  assert.equal(models[1].image, true); assert.equal(models[1].audio, true)
   assert.equal(f.rpc.started, 1)
   f.rpc.handlers.set('account/read', () => ({ account: null, requiresOpenaiAuth: true }))
   await assert.rejects(f.manager.verify(f.directory), /codex login/)
@@ -131,9 +131,9 @@ test('full paginated history preserves stable ids, deduplicates anchors and refr
   assert.equal(f.runtime.transcript(state)[1].text, 'respuesta corregida')
 })
 
-test('text keeps native configuration; explicit model/effort validated, all direct/preserveOnly inputs rejected before turns', async t => {
+test('text keeps native configuration; explicit model/effort validated, invalid direct/preserveOnly inputs rejected before turns', async t => {
   const f = await fixture(t), state = await f.runtime.open('thr-a')
-  for (const patch of [{ audioMode: 'direct' }, { preserveOnly: true }, { audioMode: 'clip', audio: { data: 'bad' } }]) await assert.rejects(f.runtime.ask(state, { ...ask(), ...patch }), /Solo transcripción/)
+  for (const patch of [{ audioMode: 'direct' }, { preserveOnly: true }, { audioMode: 'clip', audio: { data: 'bad' } }]) await assert.rejects(f.runtime.ask(state, { ...ask(), ...patch }), /clip|Audio directo/i)
   await assert.rejects(f.runtime.ask(state, { ...ask(), model: 'not-native' }), /catálogo/)
   await assert.rejects(f.runtime.ask(state, { ...ask(), model: 'codex-text', variant: 'made-up' }), /pensamiento/)
   await f.runtime.ask(state, ask())

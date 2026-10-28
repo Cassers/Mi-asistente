@@ -11,7 +11,7 @@ export class FakeCodex extends EventEmitter {
     this.history = new Map(); this.handlers = new Map(); this.unmaterialized = new Set()
   }
   thread(id, patch = {}) { return { id, cwd: this.directory, name: id, model: 'codex-text', status: { type: 'idle' }, updatedAt: 10, ...patch } }
-  async start() { this.started = (this.started || 0) + 1 }
+  async start() { this.started = (this.started || 0) + 1; return { userAgent: 'mi_asistente/0.159.0' } }
   async close() { this.closed = true; this.emit('closed') }
   respond(id, result) { this.replies.push({ id, result }) }
   reject(id) { this.rejected.push(id) }
@@ -38,6 +38,7 @@ export class FakeCodex extends EventEmitter {
     }
     if (method === 'thread/items/list') return { data: [], nextCursor: null }
     if (method === 'thread/archive') { this.threads.delete(params.threadId); return {} }
+    if (method === 'thread/inject_items') { this.unmaterialized.delete(params.threadId); return {} }
     if (method === 'turn/start') {
       this.unmaterialized.delete(params.threadId)
       const turn = { id: 'turn-' + ++this.sequence, status: 'inProgress', items: [] }

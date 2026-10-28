@@ -5,14 +5,18 @@ import { randomUUID } from 'node:crypto'
 import { CodexRpc } from './codex-rpc.mjs'
 import { Permissions } from './permissions.mjs'
 import { screenPrompt } from './screen-context.mjs'
+import { voiceAttachment } from './voice-attachment.mjs'
 
-const directError = 'Codex todavía no admite la cola de audio directo sin respuesta de este cliente. Selecciona Solo transcripción; No se envió el audio.'
+const directError = 'El modelo nativo de Codex no anuncia entrada de audio. Elige uno compatible o selecciona explícitamente Solo transcripción. No se envió el audio.'
+const clientAudioError = 'El audio directo requiere Codex CLI 0.159.0 o posterior. No se envió el audio.'
+const audioPrompt = 'Escucha los fragmentos de audio adjuntos de mi intervención en orden y responde a lo que digo. Los fragmentos conservados sin respuesta forman parte de la misma intervención.'
+const continuationPrompt = 'He retomado el habla: este audio continúa o corrige mi petición anterior. Considera también los fragmentos anteriores y no completes una respuesta que haya quedado interrumpida.'
 const busy = thread => thread?.status?.type === 'active'
 const idKey = id => `${typeof id}:${id}`
 const noopTiming = { start: () => ({ end() {} }) }
 const safeId = id => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,160}$/.test(id)
 const textItem = item => item.type === 'agentMessage' ? item.text || '' : item.type === 'userMessage'
-  ? (item.content || []).map(part => part.type === 'text' ? part.text : part.type === 'image' || part.type === 'localImage' ? '[Imagen adjunta]' : '').filter(Boolean).join('\n') : null
+  ? (item.content || []).map(part => part.type === 'text' ? part.text : part.type === 'image' || part.type === 'localImage' ? '[Imagen adjunta]' : part.type === 'audio' || part.type === 'localAudio' ? '[Audio adjunto]' : '').filter(Boolean).join('\n') : null
 
 /** Installed protocol is authoritative: no instruction, approval or sandbox overrides. */
 export class CodexRuntime extends EventEmitter {
@@ -29,7 +33,12 @@ export class CodexRuntime extends EventEmitter {
       }
     })
   }
-  async initialize() { try { await this.rpc.start(); return this } catch (error) { await this.rpc.close(); throw error } }
+  async initialize() { try {
+    const info = await this.rpc.start()
+    const version = /\/(\d+)\.(\d+)\.(\d+)\b/.exec(info?.userAgent || '')
+    this.directAudioSupported = !!version && (+version[1] > 0 || +version[2] >= 159)
+    return this
+  } catch (error) { await this.rpc.close(); throw error } }
   async pages(method, params = {}) {
     const rows = [], seen = new Set(); let cursor
     do {
@@ -54,8 +63,8 @@ export class CodexRuntime extends EventEmitter {
   async models() {
     return (await this.rawModels()).filter(m => typeof m.model === 'string' && !m.hidden).map(m => ({
       id: m.model, name: m.displayName || m.model, provider: 'Codex', free: false, cost: { input: null, output: null },
-      image: m.inputModalities?.includes('image') === true, audio: false,
-      audioReason: directError,
+      image: m.inputModalities?.includes('image') === true, audio: this.directAudioSupported && m.inputModalities?.includes('audio') === true,
+      audioReason: !this.directAudioSupported ? clientAudioError : m.inputModalities?.includes('audio') ? '' : directError,
       variants: (m.supportedReasoningEfforts || []).map(e => e.reasoningEffort).filter(e => typeof e === 'string'),
       defaultVariant: m.defaultReasoningEffort || '',
     }))
@@ -80,7 +89,7 @@ export class CodexRuntime extends EventEmitter {
     if (state) { state.model = native.model || thread.model || state.model; state.active = busy(thread); state.title = thread.name || thread.preview || state.title; return state }
     state = { id: thread.id, title: thread.name || thread.preview || 'Conversación de Codex', model: native.model || thread.model,
       items: new Map(), listeners: new Set(), liveTurn: null, active: busy(thread), op: null, deferred: [], ordinary: new Map(),
-      ephemeral: thread.ephemeral === true, historyAvailable: true, nativeLoaded: false }
+      ephemeral: thread.ephemeral === true, historyAvailable: true, nativeLoaded: false, interruptions: 0, audioUncertain: false }
     state.policy = new Permissions({ session: () => state.id, workspace: this.directory,
       reply: (id, decision) => this.answerApproval(state, id, decision),
       publish: () => this.publishPermissions(state), publishMode: policy => this.publish(state, { type: 'permission_mode', policy }) })
@@ -269,10 +278,14 @@ export class CodexRuntime extends EventEmitter {
     state.op = null; op.resolveCompletion?.(); this.update(state)
   }
   async ask(state, message, timing = noopTiming) {
-    if (message.audioMode === 'direct' || message.preserveOnly || (message.audio && message.audioMode !== 'transcript')) throw new Error(directError)
+    const direct = message.audioMode === 'direct'
+    if (message.preserveOnly && !direct || message.audio && !direct && message.audioMode !== 'transcript') throw new Error('El clip requiere el modo Audio directo explícito. No se envió el audio.')
+    if (direct && !message.audio) throw new Error('Falta el clip de audio directo; no se enviará dictado como sustituto.')
+    if (direct && !this.directAudioSupported) throw new Error(clientAudioError)
+    if (state.audioUncertain && direct) throw new Error('No se confirmó la conservación del audio anterior. Envía un mensaje escrito para continuar sin reenviar el clip, o abre otro chat.')
     if (typeof message.text !== 'string' || !message.text.trim() || message.text.length > 200000) throw new Error('Escribe un mensaje válido para Codex.')
     if (state.op || state.liveTurn) throw new Error('Codex está trabajando; espera o usa Detener respuesta.')
-    const op = { ask: message.id, starting: true, messages: new Map(), text: '', tools: new Set(), controller: new AbortController() }
+    const op = { ask: message.id, starting: true, messages: new Map(), text: '', tools: new Set(), controller: new AbortController(), direct, preserveOnly: direct && message.preserveOnly === true }
     op.prepared = new Promise(resolve => { op.resolvePrepared = resolve })
     op.completed = new Promise(resolve => { op.resolveCompletion = resolve })
     state.op = op
@@ -280,44 +293,90 @@ export class CodexRuntime extends EventEmitter {
     try {
       const thread = await this.checked(state.id)
       if (busy(thread)) throw new Error('Codex trabaja en esta conversación desde otro cliente. Espera o detenla explícitamente.')
+      const recoveringAudio = state.audioUncertain && !direct
+      if (recoveringAudio) {
+        // Public history does not expose injected raw items. Verify ownership,
+        // idle state and readable history; never claim the uncertain clip is absent
+        // or replay it. An explicitly chosen text message is the recovery action.
+        await this.hydrate(state)
+        this.publish(state, { type: 'status_error', message: 'El recibo del audio anterior sigue sin confirmar. Se continuará con tu nuevo texto, sin reenviar ese clip.' })
+      }
       const models = await this.rawModels()
       const explicit = message.model && message.model !== 'native/default'
       const selected = models.find(m => m.model === (explicit ? message.model : thread.model || state.model))
       if (explicit && !selected) throw new Error('El modelo elegido no está en el catálogo nativo de Codex.')
       if (message.variant && (!explicit || !selected?.supportedReasoningEfforts?.some(e => e.reasoningEffort === message.variant))) throw new Error('El nivel de pensamiento no corresponde al modelo elegido.')
-      let input = [{ type: 'text', text: message.text, text_elements: [] }]
+      if (direct && !selected?.inputModalities?.includes('audio')) throw new Error(directError)
+      const interruption = state.interruptions
+      let text = direct ? audioPrompt + (interruption ? '\n\n' + continuationPrompt : '') : message.text
+      let input = [{ type: 'text', text, text_elements: [] }]
+      if (direct) {
+        // Native append-only history, NOT a generated-and-immediately-aborted turn.
+        // The data URI is durable in Codex's rollout, never a temporary pathname.
+        const audio = voiceAttachment(message.audio)
+        if (op.stopping) throw new Error('Se canceló la preparación del turno.')
+        const id = 'mi_asistente_audio_' + randomUUID()
+        op.appending = true
+        try {
+          await this.rpc.request('thread/inject_items', { threadId: state.id, items: [{ type: 'message', id, role: 'user',
+            content: [{ type: 'input_text', text: '[Audio directo adjunto]' }, { type: 'input_audio', audio_url: audio.url }] }] })
+        } catch {
+          state.audioUncertain = true
+          throw new Error('Codex no confirmó la conservación del clip. Comprueba el historial nativo antes de reintentar; no se reenvió ni se sustituyó por texto.')
+        }
+        op.audioStored = true; state.historyAvailable = true
+        this.put(state, { type: 'userMessage', id, content: [{ type: 'audio' }] })
+        this.publish(state, { type: 'audio', ask: op.ask, state: 'attached', message: 'Audio conservado en el hilo nativo de Codex, sin transcripción previa.' })
+        if (op.preserveOnly || op.stopping) {
+          prepare.end(); this.update(state); this.finish(state, 'cancelled'); return
+        }
+        // Re-read interruption state after persistence: speech may have resumed
+        // while the native append was pending. Such a prefix must not generate.
+        text = '[Audio adjunto]\n' + audioPrompt + (state.interruptions ? '\n\n' + continuationPrompt : '')
+        input = [{ type: 'text', text, text_elements: [] }]
+      }
       if (this.autoScreen && selected?.inputModalities?.includes('image')) {
-        const visual = await this.screen(message.text, { signal: op.controller.signal, onState: status => this.publish(state, { type: 'screen', ask: op.ask, state: status }) })
-        input = [{ type: 'text', text: message.text + (visual.context ? '\n\n' + visual.context : ''), text_elements: [] },
+        const visual = await this.screen(text, { signal: op.controller.signal, onState: status => this.publish(state, { type: 'screen', ask: op.ask, state: status }) })
+        input = [{ type: 'text', text: text + (visual.context ? '\n\n' + visual.context : ''), text_elements: [] },
           ...visual.parts.filter(p => p.type === 'file').map(p => ({ type: 'image', url: p.url }))]
       }
+      if (direct && op.preserveOnly) { prepare.end(); this.finish(state, 'cancelled'); return }
       if (op.stopping) throw new Error('Se canceló la preparación del turno.')
       op.first = timing.start('bridge.first_text', message.traceId); op.response = timing.start('bridge.response', message.traceId)
       const result = await this.rpc.request('turn/start', { threadId: state.id, input, clientUserMessageId: randomUUID(),
         ...(explicit ? { model: selected.model, ...(message.variant ? { effort: message.variant } : {}) } : {}) })
       if (!safeId(result?.turn?.id)) throw new Error('Codex no confirmó el identificador del turno. Comprueba el historial antes de reintentar.')
       state.historyAvailable = true
+      if (recoveringAudio) state.audioUncertain = false
+      if (direct && state.interruptions === interruption) state.interruptions = 0
       op.turnId = result.turn.id; op.starting = false; state.liveTurn = op.turnId; state.active = true
       prepare.end(); this.publish(state, { type: 'submitted', ask: op.ask })
       const deferred = state.deferred.splice(0)
       for (const event of deferred) this.notification(event)
       this.update(state)
     } catch (error) {
+      op.prepareError = error
       prepare.end(op.stopping ? 'cancelled' : 'error')
       if (state.op === op) {
-        if (op.stopping) this.finish(state, 'cancelled')
+        if (op.stopping && !state.audioUncertain) this.finish(state, 'cancelled')
         else {
           op.first?.end('error'); op.response?.end('error')
           state.op = null; op.resolveCompletion(); this.update(state)
         }
       }
-      if (!op.stopping) throw error
+      if (!op.stopping || state.audioUncertain) throw error
     } finally { op.resolvePrepared() }
   }
-  async interrupt(state, timing = noopTiming) {
+  async interrupt(state, timing = noopTiming, reason = 'manual') {
     const span = timing.start('bridge.interrupt')
     const op = state.op
-    if (op?.starting) { op.stopping = true; op.controller.abort(); await op.prepared }
+    if (reason === 'speech') state.interruptions++
+    if (op?.starting) {
+      if (op.direct && reason === 'speech') op.preserveOnly = true
+      else { op.stopping = true; op.controller.abort() }
+      await op.prepared
+      if (op.direct && op.prepareError && (!op.stopping || state.audioUncertain)) { span.end('error'); throw op.prepareError }
+    }
     try {
       let turnId = state.liveTurn
       if (!turnId) {
