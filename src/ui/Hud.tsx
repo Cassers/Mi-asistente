@@ -14,6 +14,7 @@ import { HistoryControl, ScreenControl } from './CaptureControls'
 import { useProfile, displayName, wakeWord } from '../lib/profile'
 import { useVoiceInputMode, useVoiceInputStatus } from '../lib/voice-input-mode'
 import { useProjects } from '../lib/projects'
+import type { ConnectionState } from '../lib/bridge'
 
 // Input availability and answer activity are independent: muting must never
 // imply that an answer stopped, or that dormant capture accepts questions.
@@ -35,12 +36,18 @@ type HudProps = {
   onReplay?: (text: string) => void
   chatId?: string
   composerScope?: number
+  connectionState?: ConnectionState | null
+  onRetryConnection?: () => void
 }
 
-export function Hud({ onPause, onResume, onToggleMicrophone, onToggleStandby, onSubmitTranscript, onSendMessage, onReplay, chatId, composerScope }: HudProps) {
+export function Hud({ onPause, onResume, onToggleMicrophone, onToggleStandby, onSubmitTranscript, onSendMessage, onReplay, chatId, composerScope, connectionState, onRetryConnection }: HudProps) {
   const profile = useProfile()
   const inputMode = useVoiceInputMode()
   const voiceInputStatus = useVoiceInputStatus()
+  const connectionMessage = connectionState === 'exhausted' ? 'No se pudo conectar. Se agotaron los reintentos automáticos.'
+    : connectionState === 'project-required' ? 'Puente conectado. Abre un proyecto en Configuración para comenzar.'
+      : connectionState === 'lost' ? 'Sin conexión. Reintentando…'
+        : connectionState === 'open' || connectionState === 'reconnected' ? 'Puente conectado. Comprobando la conversación…' : ''
   const { selected: project } = useProjects()
   const log = useRef<HTMLDivElement>(null)
   const content = useRef<HTMLDivElement>(null)
@@ -229,6 +236,11 @@ export function Hud({ onPause, onResume, onToggleMicrophone, onToggleStandby, on
             )}
           </AnimatePresence>
 
+          {connectionMessage && <div className="connection-notice" data-state={connectionState}
+            role={connectionState === 'exhausted' ? 'alert' : 'status'}>
+            <span>{connectionMessage}</span>
+            {connectionState === 'exhausted' && onRetryConnection && <button type="button" className="surface-button" onClick={onRetryConnection}>Reintentar conexión</button>}
+          </div>}
           {error && <div className="error" role="alert">{error}</div>}
 
           <footer className="hud-bottom">

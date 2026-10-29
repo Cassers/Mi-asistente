@@ -1,4 +1,4 @@
-import { useEffect, useRef, useSyncExternalStore } from 'react'
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Scene } from './scene/Scene'
 import { Hud } from './ui/Hud'
 import { Ignition } from './ui/Ignition'
@@ -42,7 +42,7 @@ import { env } from './config'
 import { currentProfile, useProfile, refreshProfile, watchProfile, displayName, wakePattern } from './lib/profile'
 import { listeningMode } from './lib/listening-policy'
 import { selectedProject, projectMode, useProjects, subscribeProjects } from './lib/projects'
-import { conversationSnapshot, conversationRevision, subscribeConversation, permissionModeSnapshot, subscribePermissionMode } from './lib/bridge'
+import { conversationSnapshot, conversationRevision, subscribeConversation, permissionModeSnapshot, subscribePermissionMode, retryBridge, type ConnectionState } from './lib/bridge'
 import { bindWhisperScope } from './lib/whisper'
 import { timingSpan, timingTrace, timingMark, timingCapture, type TimingSpan } from './lib/voice-timing'
 
@@ -81,6 +81,7 @@ export default function App() {
   const projects = useProjects()
   const conversation = useSyncExternalStore(subscribeConversation, conversationSnapshot)
   const profile = useProfile()
+  const [connectionState, setConnectionState] = useState<ConnectionState | null>(null)
   useEffect(() => watchProfile(), [])
   useEffect(() => { document.title = displayName(profile) }, [profile])
   const store = useStore
@@ -559,7 +560,7 @@ export default function App() {
     const destination = selectedProject()?.id
     const chat = conversationSnapshot().chat?.id
     try { await warm() }
-    catch (error) { state.setError(error instanceof Error ? error.message : 'No se pudo conectar.'); return false }
+    catch { return false } // The bridge owns its connection notice; retain the draft.
     if (revision !== conversationRevision() || destination !== selectedProject()?.id || (chat && chat !== conversationSnapshot().chat?.id)) {
       state.setError('La conversación cambió antes de enviar. Tu mensaje sigue en el cuadro de texto.')
       return false
@@ -727,15 +728,13 @@ export default function App() {
           console.warn('[jarvis] unknown ui op:', op, args)
       }
     })
-    // OpenCode restores its saved chat on ready; legacy backends remain ephemeral.
+    // Transport notices are separate from user/provider/recording errors.
     watchConnection((state) => {
-      if (state === 'lost') {
-        store.getState().setError('Bridge connection lost — reconnecting.')
-      } else if (state === 'reconnected') {
-        store
-          .getState()
-          .setError('Conexión restablecida; comprobando la conversación.')
-      }
+      // Retire only the two old connection-owned banners after an HMR update.
+      const error = store.getState().error
+      if ((state === 'ready' || state === 'project-required') &&
+        (error === 'Bridge connection lost — reconnecting.' || error === 'Conexión restablecida; comprobando la conversación.')) store.getState().setError(null)
+      setConnectionState(state)
     })
   }
 
@@ -753,7 +752,7 @@ export default function App() {
     await refreshProfile()
 
     configureClient()
-    const warming = warm().catch((err: Error) => s.setError(err.message))
+    const warming = warm().catch(() => {})
 
     if (!usingBridge && !env.anthropicKey) {
       s.setError(
@@ -809,7 +808,7 @@ export default function App() {
     if (!usingBridge || !projects.available) return
     configureClient()
     // Opening a project establishes its native chat without opening capture.
-    void warm().catch((error: Error) => store.getState().setError(error.message))
+    void warm().catch(() => {})
     void probeCapabilities().catch(() => {})
     // Handlers read current stores/refs; registering again replaces subscriptions.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1005,7 +1004,7 @@ export default function App() {
   return (
     <>
       <Scene />
-      <Hud chatId={conversation.chat?.id} composerScope={conversationRevision()} onPause={pauseConversation} onResume={() => onWake('')} onToggleStandby={toggleStandby} onSendMessage={sendTextMessage} onReplay={replayResponse} onSubmitTranscript={() => { sendTranscript() }} onToggleMicrophone={() => {
+      <Hud connectionState={usingBridge ? connectionState : null} onRetryConnection={() => { void retryBridge().catch(() => {}) }} chatId={conversation.chat?.id} composerScope={conversationRevision()} onPause={pauseConversation} onResume={() => onWake('')} onToggleStandby={toggleStandby} onSendMessage={sendTextMessage} onReplay={replayResponse} onSubmitTranscript={() => { sendTranscript() }} onToggleMicrophone={() => {
         if (store.getState().phase === 'offline' && !store.getState().microphoneMuted) void powerOn()
         else void toggleMicrophone()
       }} />

@@ -479,3 +479,23 @@ test('settings capability selector keeps stable store hook count through unavail
   app.state.projectAvailable=false;assert.equal(app.render('ConversationsPanel'),null);assert.equal(app.storeHookCount,initial)
   app.state.projectAvailable=true;app.render('ConversationsPanel');assert.equal(app.storeHookCount,initial)
 })
+
+test('connection notices expose bounded retry and project choice independently of provider errors and microphone controls', () => {
+  const h = harness(); let retries = 0
+  h.state.error = 'Whisper local: error independiente'
+  const props = { onRetryConnection: () => retries++, onToggleMicrophone: () => assert.fail('retry cannot activate microphone') }
+  let tree = h.render('Hud', { ...props, connectionState: 'lost' })
+  assert.match(renderToStaticMarkup(tree), /Sin conexión\. Reintentando/)
+  assert.equal(button(tree, 'Reintentar conexión'), undefined)
+  tree = h.render('Hud', { ...props, connectionState: 'exhausted' })
+  assert.equal(byClass(tree, 'connection-notice').props.role, 'alert')
+  assert.match(renderToStaticMarkup(tree), /Se agotaron los reintentos automáticos/)
+  button(tree, 'Reintentar conexión').props.onClick(); assert.equal(retries, 1)
+  tree = h.render('Hud', { ...props, connectionState: 'project-required' })
+  assert.match(renderToStaticMarkup(tree), /Puente conectado\. Abre un proyecto en Configuración/)
+  assert.doesNotMatch(text(byClass(tree, 'connection-notice')), /perdida|reintentando|comprobando/i)
+  tree = h.render('Hud', { ...props, connectionState: 'ready' })
+  assert.equal(byClass(tree, 'connection-notice'), undefined)
+  assert.match(renderToStaticMarkup(tree), /Whisper local: error independiente/)
+  assert.equal(h.state.microphoneActive, true); assert.equal(h.state.microphoneMuted, false)
+})

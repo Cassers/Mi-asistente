@@ -130,7 +130,7 @@ export async function chooseConversation(id: string = 'new') {
   requestedConversation = id
   manualSwitch = true
   connectionEpoch++; connecting = null
-  clearTimeout(reconnectTimer)
+  clearTimeout(reconnectTimer); reconnectTimer = 0
   const old = socket
   if (old && old.readyState !== WebSocket.CLOSED) {
     await new Promise<void>((resolve) => {
@@ -263,8 +263,10 @@ export function watchUi(fn: (op: string, args: any) => void) {
  *   'open'        — first connection of the page.
  *   'lost'        — transport disconnected; OpenCode keeps its saved conversation.
  *   'reconnected' — transport is back; ready confirms the actual session loaded.
+ *   'ready' / 'project-required' — valid protocol response, with/without a project.
+ *   'exhausted'   — bounded automatic recovery ended; explicit retry remains.
  */
-export type ConnectionState = 'open' | 'lost' | 'reconnected'
+export type ConnectionState = 'open' | 'lost' | 'reconnected' | 'ready' | 'project-required' | 'exhausted'
 let onConnection: ((state: ConnectionState) => void) | null = null
 export function watchConnection(fn: (state: ConnectionState) => void) {
   onConnection = fn
@@ -300,13 +302,25 @@ let attempt = 0
 let reconnectTimer = 0
 
 function scheduleReconnect() {
-  if (attempt >= RECONNECT_DELAYS.length) return
-  const delay = RECONNECT_DELAYS[attempt]
-  attempt += 1
   clearTimeout(reconnectTimer)
-  reconnectTimer = window.setTimeout(() => {
-    void connect().catch(() => {})
+  reconnectTimer = 0
+  if (manualSwitch) return
+  if (attempt >= RECONNECT_DELAYS.length) { onConnection?.('exhausted'); return }
+  const epoch = connectionEpoch
+  const projectID = selectedProject()?.id || ''
+  const delay = RECONNECT_DELAYS[attempt++]
+  const timer = window.setTimeout(() => {
+    if (reconnectTimer !== timer || manualSwitch || epoch !== connectionEpoch || (selectedProject()?.id || '') !== projectID) return
+    reconnectTimer = 0
+    const dialing = connect()
+    const owner = connectionEpoch
+    // A failed handshake never becomes the current socket, so its close
+    // handler cannot schedule the next attempt. This catch owns that path.
+    void dialing.catch(() => {
+      if (!manualSwitch && owner === connectionEpoch && !reconnectTimer && (selectedProject()?.id || '') === projectID) scheduleReconnect()
+    })
   }, delay)
+  reconnectTimer = timer
 }
 
 /**
@@ -371,7 +385,10 @@ function dispatch(ws: WebSocket) {
       if (conversation) { conversation = { ...conversation, turns: msg.turns, busy: msg.busy === true }; publishConversation() }
     } else if (msg.type === 'project_required') {
       connectionTimings.get(ws)?.end()
-      servers = []; firstReady.resolve()
+      attempt = 0
+      servers = []; onServers?.(servers)
+      firstReady.resolve()
+      onConnection?.('project-required')
     } else if (msg.type === 'ready') {
       const caps = msg.capabilities
       useStore.setState({ applicationCapabilities: caps && typeof caps.screenOptIn === 'boolean' ? {
@@ -386,7 +403,9 @@ function dispatch(ws: WebSocket) {
         conversation = msg.conversation
         requestedConversation = conversation.id
         try { localStorage.setItem(chatKey(), conversation.id) } catch { /* session still works without browser storage */ }
-        useStore.setState({ turns: conversation.turns, caption: '', screenCapture: 'off', error: null })
+        // Connection notices have their own UI channel. A ready frame must
+        // never erase unrelated transcription, provider or recording errors.
+        useStore.setState({ turns: conversation.turns, caption: '', screenCapture: 'off' })
         publishConversation()
       }
       // The bridge announces immediately on connect from Claude Code's config,
@@ -396,7 +415,9 @@ function dispatch(ws: WebSocket) {
         .map((s) => (typeof s === 'string' ? s : (s.name ?? '')))
         .filter(Boolean)
       onServers?.(servers)
+      attempt = 0
       firstReady.resolve()
+      onConnection?.('ready')
     } else if (msg.type === 'panel' && msg.panel) {
       onPanel?.(msg.panel)
     } else if (msg.type === 'blade' && msg.blade) {
@@ -478,7 +499,9 @@ function connect(): Promise<WebSocket> {
       publishPolicy({ mode: 'manual', autoApproved: 0, connected: false, pending: false, error: '' })
       socket = ws
       permissionIDs = new Set()
-      attempt = 0
+      // Only application readiness (or project_required), not an open TCP
+      // transport, resets the bounded recovery budget.
+      clearTimeout(reconnectTimer); reconnectTimer = 0
       dispatch(ws)
       settle(null)
       onConnection?.(everConnected ? 'reconnected' : 'open')
@@ -523,8 +546,7 @@ function connect(): Promise<WebSocket> {
         publishPolicy({ mode: 'manual', autoApproved: 0, connected: false, pending: false, error: '' })
         socket = null
         onPermissions?.([])
-        onConnection?.('lost')
-        if (!manualSwitch) scheduleReconnect()
+        if (!manualSwitch) { onConnection?.('lost'); scheduleReconnect() }
       }
     }
   })
@@ -534,13 +556,35 @@ function connect(): Promise<WebSocket> {
 
 /** Open the socket early so the first "Hey Jarvis" isn't waiting on a handshake. */
 export async function warmBridge(): Promise<void> {
-  await connect()
+  const dialing = connect()
+  const owner = connectionEpoch
+  try { await dialing }
+  catch (error) {
+    if (!manualSwitch && owner === connectionEpoch && !reconnectTimer) {
+      onConnection?.('lost'); scheduleReconnect()
+    }
+    throw error
+  }
   // Don't block startup if the bridge never announces — the dispatcher fills
   // the rail in whenever the list does turn up.
   await Promise.race([
     firstReady.promise,
     new Promise<void>((resolve) => setTimeout(resolve, 2500)),
   ])
+}
+
+/** Explicit recovery uses only the current selected destination/session. */
+export function retryBridge(): Promise<void> {
+  if (manualSwitch) return Promise.reject(new Error('Espera a que termine el cambio de conversación.'))
+  if (socket?.readyState === WebSocket.OPEN) return warmBridge()
+  clearTimeout(reconnectTimer); reconnectTimer = 0; attempt = 0
+  onConnection?.('lost')
+  const dialing = connect()
+  const owner = connectionEpoch
+  return dialing.then(() => {}, error => {
+    if (!manualSwitch && owner === connectionEpoch && !reconnectTimer) scheduleReconnect()
+    throw error
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -985,7 +1029,7 @@ subscribeProjects(() => {
   if (socket) recordingVersions.delete(socket)
   manualSwitch = true
   connectionEpoch++; connecting = null
-  clearTimeout(reconnectTimer)
+  clearTimeout(reconnectTimer); reconnectTimer = 0
   const old = socket
   const reconnect = () => {
     manualSwitch = false

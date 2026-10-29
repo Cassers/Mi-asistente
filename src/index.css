@@ -2349,3 +2349,12 @@ kbd {
   .audio-attachment__scope { flex-basis: 100%; }
   .audio-attachment__actions .surface-button { min-height: 44px; }
 }
+
+
+.conversation-dock .connection-notice {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 8px;
+  color: #bed1d8; font: 13px/1.5 system-ui, sans-serif; text-transform: none; letter-spacing: normal;
+  overflow-wrap: anywhere;
+}
+.conversation-dock .connection-notice[data-state='lost'] { color: #ffe0a8; }
+.conversation-dock .connection-notice[data-state='exhausted'] { color: #ffb9c1; }
