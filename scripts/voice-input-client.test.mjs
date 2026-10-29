@@ -7,6 +7,7 @@ import { timingStub } from './timing-fixture.mjs'
 
 async function setup(captureStatus = 'missing', select = async () => ({ model: 'opencode-go/muse-spark-1.2-contributor', variant: 'high' })) {
   let mode = 'clip'
+  const state = { autoScreen: false }
   const statuses = [], instances = []
   class Socket {
     static OPEN = 1
@@ -26,11 +27,12 @@ async function setup(captureStatus = 'missing', select = async () => ({ model: '
       : id === './timings' ? timingStub() : id === './voice-input-mode' ? { currentVoiceInputMode: () => mode, reportVoiceInput: text => statuses.push(text) }
       : id === './models' ? { currentModelSelection: select }
       : id === './projects' ? { selectedProject: () => null, subscribeProjects: () => () => {} }
-      : id === '../config' ? { BRIDGE_WS_URL: 'ws://127.0.0.1:8787' } : { useStore: { setState() {}, getState: () => ({}) } },
+      : id === '../config' ? { BRIDGE_WS_URL: 'ws://127.0.0.1:8787' } : { useStore: { setState() {}, getState: () => state } },
   })
   const warming = exports.warmBridge(), ws = instances[0]
   ws.open(); ws.emit({ type: 'ready', servers: ['opencode'] }); await warming
-  return { app: exports, ws, statuses, setMode: value => { mode = value } }
+  ws.emit({ type: 'recording', recording: { active: false, controlVersion: 1 } })
+  return { app: exports, ws, statuses, state, setMode: value => { mode = value } }
 }
 
 test('transcript selection strips captured audio before WebSocket serialization', async () => {
@@ -159,4 +161,25 @@ test('typed messages force text serialization even when voice preference is dire
   const next = f.ws.sent.filter(message => message.type === 'ask').at(-1)
   assert.equal(next.audioMode, 'direct'); assert.equal(next.audio.data, 'next-clip')
   f.ws.emit({ type: 'done', ask: next.id, text: 'Respuesta' }); await audio
+})
+
+
+test('actual ask frames carry explicit per-turn screen choice independently of transcript mode', async () => {
+  const f = await setup(); f.setMode('transcript')
+  for (const enabled of [false, true, false]) {
+    f.state.autoScreen = enabled
+    const pending = f.app.ask('Mira mi pantalla', { onText() {}, onTool() {} })
+    for (let i = 0; i < 12; i++) await Promise.resolve()
+    const sent = f.ws.sent.filter(frame => frame.type === 'ask').at(-1)
+    assert.equal(sent.screen, enabled); assert.equal(sent.audioMode, 'transcript'); assert.equal(sent.audio, undefined)
+    f.ws.emit({ type: 'done', ask: sent.id, text: 'fixture' }); await pending
+  }
+})
+
+
+test('requested sharing rejects an old backend before sending a text-only ask', async () => {
+  const f = await setup(); f.setMode('transcript'); f.state.autoScreen = true
+  f.ws.emit({ type: 'recording', recording: { active: false } })
+  await assert.rejects(f.app.ask('Mira', { onText() {}, onTool() {} }), /Reinicia el puente/)
+  assert.equal(f.ws.sent.some(frame => frame.type === 'ask'), false)
 })

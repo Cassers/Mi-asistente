@@ -9,6 +9,7 @@ const deferred = () => { let resolve; const promise = new Promise(yes => { resol
 
 async function fixture({ select, connected = true, application = 'opencode' } = {}) {
   let project = { id: 'p1', application }, mode = 'direct', model = 'native/default', timer = 0
+  const state = { autoScreen: false }
   const watchers = new Set(), sockets = [], statuses = [], text = [], queueSpans = [], storage = new Map()
   class Socket {
     static OPEN = 1; static CLOSED = 3
@@ -18,14 +19,14 @@ async function fixture({ select, connected = true, application = 'opencode' } = 
     removeEventListener(type, fn) { this.listeners.get(type)?.delete(fn) }
     send(raw) { this.sent.push(JSON.parse(raw)) }
     emit(message) { for (const fn of [...(this.listeners.get('message') || [])]) fn({ data: JSON.stringify(message) }) }
-    open(chat = 'c1') { this.readyState = 1; this.onopen(); this.emit({ type: 'ready', servers: [project.application], conversation: { id: chat, turns: [], entries: [], title: 'fixture' } }) }
+    open(chat = 'c1') { this.readyState = 1; this.onopen(); this.emit({ type: 'ready', servers: [project.application], conversation: { id: chat, turns: [], entries: [], title: 'fixture' } }); this.emit({ type: 'recording', recording: { active: false, controlVersion: 1 } }) }
     close() { this.readyState = 3; this.onclose?.(); for (const fn of [...(this.listeners.get('close') || [])]) fn({}) }
   }
   const timings = timingStub()
   const exports = {}
   const dependencies = {
     '../config': { BRIDGE_WS_URL: 'ws://localhost:8787' },
-    '../store': { useStore: { setState() {}, getState: () => ({}) } },
+    '../store': { useStore: { setState: patch => Object.assign(state, patch), getState: () => state } },
     './projects': { selectedProject: () => project, subscribeProjects: fn => { watchers.add(fn); return () => watchers.delete(fn) } },
     './models': { currentModelSelection: () => select ? select() : Promise.resolve(model === 'native/default' ? {} : { model, variant: 'high' }) },
     './voice-input-mode': { currentVoiceInputMode: () => project.application === 'codex' ? 'transcript' : mode, reportVoiceInput: value => statuses.push(value) },
@@ -43,7 +44,7 @@ async function fixture({ select, connected = true, application = 'opencode' } = 
   })
   if (connected) { const warming = exports.warmBridge(); sockets[0].open(); await warming }
   const ask = (id, audio = { mime: 'audio/wav', data: id }) => exports.ask('fixed direct instruction', { onText: delta => text.push({ id, delta }), onTool() {} }, audio, `trace-${id}`)
-  return { app: exports, sockets, statuses, text, queueSpans, ask,
+  return { app: exports, state, sockets, statuses, text, queueSpans, ask,
     get ws() { return sockets.at(-1) }, frames: (ws = sockets.at(-1)) => ws.sent.filter(frame => frame.type === 'ask'),
     ack(ws = sockets.at(-1)) { const stop = ws.sent.filter(frame => frame.type === 'interrupt').at(-1); assert.ok(stop); ws.emit({ type: 'interrupted', requestID: stop.requestID, status: 'ok' }); return stop },
     done(frame, ws = sockets.at(-1)) { ws.emit({ type: 'done', ask: frame.id, text: frame.preserveOnly ? '' : 'answer', status: frame.preserveOnly ? 'cancelled' : 'ok' }) },
@@ -184,4 +185,20 @@ test('switching to Codex detaches unsent OpenCode audio and sends only fresh dic
   assert.equal(f.frames().length, 1); assert.equal(f.frames()[0].text, 'New dictated words')
   assert.equal(f.frames()[0].audioMode, 'transcript'); assert.equal(f.frames()[0].audio, undefined)
   f.done(f.frames()[0]); await text
+})
+
+
+test('screen sharing consent is revoked on every project and chat destination change', async () => {
+  const f = await fixture(); f.setMode('transcript'); f.state.autoScreen = true
+  const one = f.app.ask('A', { onText() {}, onTool() {} }); await flush()
+  assert.equal(f.frames().at(-1).screen, true); f.done(f.frames().at(-1)); await one
+  f.setProject('p2'); await flush(); f.ws.open('c2'); await flush()
+  assert.equal(f.state.autoScreen, false)
+  const two = f.app.ask('B', { onText() {}, onTool() {} }); await flush()
+  assert.equal(f.frames().at(-1).screen, false); f.done(f.frames().at(-1)); await two
+  f.state.autoScreen = true
+  const change = f.app.chooseConversation('c3'); await flush(); f.ws.open('c3'); await change
+  assert.equal(f.state.autoScreen, false)
+  const three = f.app.ask('C', { onText() {}, onTool() {} }); await flush()
+  assert.equal(f.frames().at(-1).screen, false); f.done(f.frames().at(-1)); await three
 })

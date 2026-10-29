@@ -58,6 +58,7 @@ let socket: WebSocket | null = null
 let connecting: Promise<WebSocket> | null = null
 let connectionEpoch = 0
 let destinationRevision = 0
+const recordingVersions = new WeakMap<WebSocket, number>()
 const connectionTimings = new WeakMap<WebSocket, ReturnType<typeof startTiming>>()
 let stopSequence = 0
 const stops = new WeakMap<WebSocket, { id: string; promise: Promise<void>; resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>()
@@ -122,6 +123,8 @@ export async function chooseConversation(id: string = 'new') {
   detachDirectClips()
   pending?.finish(undefined, 'detached')
   destinationRevision++
+  useStore.setState({ autoScreen: false, screenCapture: 'off', recording: null })
+  if (socket) recordingVersions.delete(socket)
   conversation = null; publishConversation()
   requestedConversation = id
   manualSwitch = true
@@ -185,9 +188,25 @@ export function replyPermission(id: string, reply: 'once' | 'reject') {
 export function replyUserInput(id: string, answers: Record<string, { answers: string[] }>) {
   return sendNativeReply(id, { type: 'user_input', answers })
 }
+let recordingSequence = 0
+const recordingRequests = new Map<string, { ws: WebSocket; active: boolean; resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>()
+function settleRecording(id: string, error?: Error) {
+  const request = recordingRequests.get(id)
+  if (!request) return
+  clearTimeout(request.timer); recordingRequests.delete(id)
+  if (error) request.reject(error); else request.resolve()
+}
 export async function setRecordingActive(active: boolean) {
   const ws = await connect()
-  ws.send(JSON.stringify({ type: 'recording', active }))
+  if (active && recordingVersions.get(ws) !== 1) throw new Error('Reinicia el puente para activar el historial con controles de privacidad compatibles. No se inició la grabación.')
+  const microphone = !useStore.getState().microphoneMuted
+  const requestID = 'recording-' + ++recordingSequence
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => settleRecording(requestID, new Error('No se confirmó el cambio del historial. Comprueba la conexión y reintenta.')), 10000)
+    recordingRequests.set(requestID, { ws, active, resolve, reject, timer })
+    try { ws.send(JSON.stringify({ type: 'recording', active, microphone, requestID })) }
+    catch { settleRecording(requestID, new Error('No se pudo enviar el cambio del historial.')) }
+  })
 }
 
 /** Panels arrive out of band — they're pushed while a turn is in flight,
@@ -312,6 +331,7 @@ function dispatch(ws: WebSocket) {
     } else if (msg.type === 'status_error') {
       const error = new Error(msg.message || 'La aplicación no pudo completar la operación.')
       if (msg.ask || msg.requestID) settleNativeReply((msg.ask || msg.requestID)!, error)
+      if (msg.requestID) settleRecording(msg.requestID, error)
       useStore.getState().setError?.(error.message)
     } else if (msg.type === 'timing') {
       receiveTiming(msg.event)
@@ -334,7 +354,16 @@ function dispatch(ws: WebSocket) {
       for (const [id, pending] of nativeReplies) if (pending.ws === ws && !permissionIDs.has(id)) settleNativeReply(id)
       onPermissions?.(msg.requests)
     } else if (msg.type === 'recording' && msg.recording) {
+      recordingVersions.set(ws, msg.recording.controlVersion ?? 0)
       onRecording?.(msg.recording)
+      if (!msg.requestID && msg.recording.controlVersion !== 1) {
+        for (const [id, request] of recordingRequests) if (request.ws === ws) settleRecording(id, new Error('El puente necesita reiniciarse para confirmar cambios del historial.'))
+      }
+      if (msg.requestID) {
+        const request = recordingRequests.get(msg.requestID)
+        settleRecording(msg.requestID, request && (msg.recording.active !== request.active || request.active && msg.recording.error)
+          ? new Error(msg.recording.error || 'El historial no confirmó el estado solicitado. Reintenta.') : undefined)
+      }
     } else if (msg.type === 'session_update' && Array.isArray(msg.turns)) {
       useStore.setState({ turns: msg.turns })
       if (conversation) { conversation = { ...conversation, turns: msg.turns, busy: msg.busy === true }; publishConversation() }
@@ -469,6 +498,8 @@ function connect(): Promise<WebSocket> {
       )
     }
     ws.onclose = () => {
+      recordingVersions.delete(ws)
+      for (const [id, request] of recordingRequests) if (request.ws === ws) settleRecording(id, new Error('Se perdió la conexión antes de confirmar el historial. Reintenta al conectar.'))
       for (const [id, pending] of nativeReplies) if (pending.ws === ws) settleNativeReply(id, new Error('La conexión cambió antes de confirmar tu respuesta.'))
       if (socket === ws) permissionIDs = new Set()
       settleStop(ws, new Error('La conexión cambió antes de confirmar la interrupción.'))
@@ -477,6 +508,7 @@ function connect(): Promise<WebSocket> {
       // session, and the two want different handling.
       settle(new Error('The bridge closed the connection.'))
       if (socket === ws) {
+        useStore.setState({ autoScreen: false, screenCapture: 'off', recording: null })
         policyRequestID = null
         publishPolicy({ mode: 'manual', autoApproved: 0, connected: false, pending: false, error: '' })
         socket = null
@@ -809,6 +841,10 @@ async function askTurn(
             break
           case 'screen':
             firstActivity.end()
+            if (msg.state === 'unsupported') {
+              handlers.onScreen?.('failed')
+              useStore.getState().setError?.(msg.message || 'El modelo seleccionado no admite imágenes.')
+            }
             if (msg.state === 'capturing' || msg.state === 'attached' || msg.state === 'failed') {
               handlers.onScreen?.(msg.state)
             }
@@ -853,6 +889,9 @@ async function askTurn(
     arm()
 
     try {
+      if (useStore.getState().autoScreen === true && recordingVersions.get(ws) !== 1) {
+        throw new Error('Reinicia el puente y vuelve a activar Compartir pantalla. No se envió la pregunta sin su captura solicitada.')
+      }
       if (servers.includes('codex') && (audio || audioMode !== 'transcript')) {
         throw new Error('Codex usa solo dictado del navegador. No se envió el clip ni su subtítulo.')
       }
@@ -860,7 +899,7 @@ async function askTurn(
         if (!validDirect(direct) || socket !== ws) { finish('', 'detached'); return }
         direct.sent = true; direct.submittedPreserveOnly = direct.preserveOnly
       }
-      ws.send(JSON.stringify({ type: 'ask', text: prompt, id, traceId, ...selection, audioMode,
+      ws.send(JSON.stringify({ type: 'ask', text: prompt, id, traceId, ...selection, audioMode, screen: useStore.getState().autoScreen === true,
         ...(direct?.preserveOnly ? { preserveOnly: true } : {}), ...(audio && audioMode !== 'transcript' ? { audio } : {}) }))
     } catch (err) {
       // The socket can go into CLOSING between connect() resolving and here.
@@ -930,7 +969,8 @@ subscribeProjects(() => {
   detachDirectClips()
   pending?.finish(undefined, 'detached')
   requestedConversation = null; conversation = null; publishConversation()
-  useStore.setState({ turns: [], caption: '', permissions: [], screenCapture: 'off' })
+  useStore.setState({ turns: [], caption: '', permissions: [], screenCapture: 'off', autoScreen: false, recording: null })
+  if (socket) recordingVersions.delete(socket)
   manualSwitch = true
   connectionEpoch++; connecting = null
   clearTimeout(reconnectTimer)

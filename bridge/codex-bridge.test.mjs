@@ -87,6 +87,7 @@ test('WS input cancellation answers native id; archive is recoverable and hard a
 test('Codex boundary advertises transcript-only and rejects direct, preserveOnly and attached-audio bypasses', async t => {
   const f = await fixture(t), { socket } = await connect(f)
   const ready = socket.frames.find(frame => frame.type === 'ready')
+  assert.equal(ready.capabilities.screenOptIn, true); assert.equal(ready.capabilities.recordingControlVersion, 1)
   assert.equal(ready.capabilities.directAudio, false); assert.equal(ready.capabilities.transcriptOnly, true)
   for (const patch of [{ audioMode: 'direct' }, { preserveOnly: true }, { audioMode: 'transcript', audio: { mime: 'audio/wav', data: 'old-prefix' } }]) {
     socket.message({ type: 'ask', id: 'blocked', text: 'old caption', ...patch }); await flush()
@@ -95,4 +96,21 @@ test('Codex boundary advertises transcript-only and rejects direct, preserveOnly
   assert.equal(socket.frames.filter(frame => frame.type === 'error').length, 3)
   socket.message({ type: 'ask', id: 'text', text: 'Fresh intentional text', audioMode: 'transcript' }); await flush()
   assert.equal(f.rpc.calls.filter(call => call.method === 'turn/start').length, 1)
+})
+
+
+test('history control returns correlated confirmation and recoverable startup failure without real capture', async t => {
+  const f = await fixture(t), calls = []
+  let active = false
+  const fake = { snapshot: () => ({ active }), setActive: async (value, options) => {
+    calls.push([value, options]); if (value) throw new Error('Fixture capture permission denied'); active = value
+  } }
+  const { socket } = await connect(f, new FakeSocket(), { recorder: fake })
+  socket.message({ type: 'recording', active: true, microphone: false, requestID: 'start-history' }); await flush()
+  const error = socket.frames.find(frame => frame.requestID === 'start-history')
+  assert.equal(error.type, 'status_error'); assert.match(error.message, /permission denied/)
+  socket.message({ type: 'recording', active: false, requestID: 'stop-history' }); await flush()
+  const ack = socket.frames.find(frame => frame.requestID === 'stop-history')
+  assert.equal(ack.type, 'recording'); assert.equal(ack.recording.active, false)
+  assert.deepEqual(calls, [[true, { microphone: false }], [false, { microphone: true }]]); assert.equal(f.rpc.calls.some(c => c.method === 'turn/start'), false)
 })

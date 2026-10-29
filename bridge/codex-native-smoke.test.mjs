@@ -8,6 +8,8 @@ import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { CodexManager } from './codex-runtime.mjs'
 import { CodexRpc } from './codex-rpc.mjs'
+import { screenPrompt } from './screen-context.mjs'
+import { deflateSync } from 'node:zlib'
 
 // Opt in with JARVIS_CODEX_NATIVE_SMOKE=1; optionally set JARVIS_CODEX_CLI to
 // an installed CLI path. No auth/config is copied and every model request goes
@@ -66,8 +68,18 @@ test('installed Codex: empty reconnect, first turn, persisted resume, native AGE
   mock.listen(0, '127.0.0.1'); await once(mock, 'listening')
   await mkdir(home); await mkdir(directory)
   await writeFile(join(directory, 'AGENTS.md'), '# Native fixture\nCODEX_NATIVE_AGENTS_INCLUDED: retain native folder context.\n')
+  // Deterministic simulated text/image catalog, never a real-account capability claim.
+  await writeFile(join(root, 'models.json'), JSON.stringify({ models: [{
+    slug: 'gpt-5.4', display_name: 'Local text/image fixture', description: 'Local fixture only', base_instructions: 'Native protocol fixture.',
+    default_reasoning_level: 'low', supported_reasoning_levels: [{ effort: 'low', description: 'Fixture' }],
+    shell_type: 'unified_exec', visibility: 'list', supported_in_api: true, priority: 1,
+    input_modalities: ['text', 'image'], experimental_supported_tools: [], prefer_websockets: false,
+    supports_reasoning_summaries: false, supports_parallel_tool_calls: false, support_verbosity: false,
+    truncation_policy: { mode: 'tokens', limit: 10000 },
+  }] }))
   await writeFile(join(home, 'config.toml'), `
 model = "gpt-5.4"
+model_catalog_json = ${JSON.stringify(join(root, 'models.json'))}
 model_provider = "localhost_fixture"
 approval_policy = "on-request"
 approvals_reviewer = "user"
@@ -91,7 +103,21 @@ enabled = false
 command = ${JSON.stringify(process.execPath)}
 args = ${JSON.stringify([fileURLToPath(new URL('./codex-mcp-fixture.mjs', import.meta.url)), mcpPids])}
 `)
-  const createManager = () => new CodexManager({ autoScreen: false, transportFactory: cwd => {
+  // Valid 1x1 RGB PNG, generated locally. No desktop or camera is opened.
+  const pngChunk = (type, data) => {
+    const content = Buffer.concat([Buffer.from(type), data])
+    let crc = 0xffffffff
+    for (const byte of content) { crc ^= byte; for (let bit = 0; bit < 8; bit++) crc = crc >>> 1 ^ (crc & 1 ? 0xedb88320 : 0) }
+    const header = Buffer.alloc(4), checksum = Buffer.alloc(4)
+    header.writeUInt32BE(data.length); checksum.writeUInt32BE((crc ^ 0xffffffff) >>> 0)
+    return Buffer.concat([header, content, checksum])
+  }
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(1, 0); ihdr.writeUInt32BE(1, 4); ihdr[8] = 8; ihdr[9] = 2
+  const png = Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]), pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(Buffer.from([0, 255, 0, 0]))), pngChunk('IEND', Buffer.alloc(0))])
+  const createManager = () => new CodexManager({ autoScreen: false,
+    screen: (text, options) => screenPrompt(text, { ...options, capture: async () => ({ data: png.toString('base64'), mimeType: 'image/png' }) }),
+    transportFactory: cwd => {
     const rpc = new CodexRpc({ cwd, command: process.env.JARVIS_CODEX_CLI || 'codex',
       env: { PATH: process.env.PATH, CODEX_HOME: home }, requestTimeoutMs: 10000 })
     const request = rpc.request.bind(rpc)
@@ -171,6 +197,21 @@ args = ${JSON.stringify([fileURLToPath(new URL('./codex-mcp-fixture.mjs', import
   await runtime.open(threadId)
   assert.deepEqual(runtime.transcript(state).filter(row => row.role === 'user').map(row => row.text), ['First fixture turn.', 'Second fixture turn; request command approval.'])
   assert.equal(requests.length, 3, 'two user turns and one native tool continuation')
+  const imageFrames = [], question = 'Synthetic screen question: preserve these exact words.'
+  runtime.subscribe(state, frame => imageFrames.push(frame))
+  assert.equal((await runtime.models()).find(model => model.id === 'gpt-5.4')?.image, true)
+  await runtime.ask(state, { id: 'screen-share', text: question, model: 'gpt-5.4', screen: true, audioMode: 'transcript' })
+  await waitFor(() => imageFrames.some(frame => frame.type === 'done'))
+  assert.equal(imageFrames.find(frame => frame.type === 'done').status, 'ok')
+  assert.ok(imageFrames.some(frame => frame.type === 'screen' && frame.state === 'attached'))
+  const content = requests.at(-1).input.filter(item => item.role === 'user').flatMap(item => item.content || [])
+  assert.ok(content.some(part => part.type === 'input_text' && part.text.includes(question)))
+  const image = content.find(part => part.type === 'input_image')
+  assert.ok(image, 'real native provider request must contain input_image, never just a text filename')
+  assert.match(image.image_url, /^data:image\/png;base64,/)
+  assert.deepEqual(Buffer.from(image.image_url.split(',')[1], 'base64'), png)
+  assert.match(JSON.stringify(requests.at(-1)), /CODEX_NATIVE_AGENTS_INCLUDED/)
+  assert.equal(requests.length, 4, 'screen is one additional native turn with no external provider')
   await assert.rejects(access(join(home, 'auth.json')))
   detach()
   assert.equal(mockError, undefined)

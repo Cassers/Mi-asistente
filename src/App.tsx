@@ -631,7 +631,7 @@ export default function App() {
     watchServers((servers) => store.getState().setConnected(servers))
     watchRecording((recording) => {
       store.getState().setRecording(recording)
-      if ((store.getState().microphoneMuted || store.getState().microphoneStandby) && recording.active) pauseHistoryForPrivacy()
+      if (store.getState().microphoneMuted && recording.active && recording.audio?.includes('mic') !== false) pauseHistoryForPrivacy()
     })
     watchPermissions((permissions) => store.getState().setPermissions(permissions))
     watchPanels((panel) => store.getState().pushPanel(panel))

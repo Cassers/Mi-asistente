@@ -228,10 +228,12 @@ type State = {
   setMicrophoneBusy: (busy: boolean) => void
   conversationPaused: boolean
   setConversationPaused: (paused: boolean) => void
-  recording: { active: boolean; fps: number; error?: string; root: string } | null
+  recording: { active: boolean; fps: number; error?: string; root: string; audio?: string[]; controlVersion?: number } | null
   permissions: PermissionRequest[]
   setPermissions: (permissions: PermissionRequest[]) => void
   setRecording: (recording: State['recording']) => void
+  autoScreen: boolean
+  setAutoScreen: (enabled: boolean) => void
   screenCapture: 'off' | 'capturing' | 'attached' | 'failed'
   setScreenCapture: (state: State['screenCapture']) => void
   phase: Phase
@@ -311,6 +313,8 @@ export const useStore = create<State>((set) => ({
   setPermissions: (permissions) => set({ permissions }),
   recording: null,
   setRecording: (recording) => set({ recording }),
+  autoScreen: false,
+  setAutoScreen: (autoScreen) => set({ autoScreen }),
   screenCapture: 'off',
   setScreenCapture: (screenCapture) => set({ screenCapture }),
   phase: 'offline',

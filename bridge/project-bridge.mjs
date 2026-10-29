@@ -86,7 +86,7 @@ const server = http.createServer(async (req, res) => {
       const accepted = payload.events.filter(e => e?.phase === 'end' && timingStore.add(e, 'browser')).length
       return json(200, { accepted })
     }
-    if (req.method === 'GET' && url.pathname === '/health') return json(200, { ok: true, brain: 'opencode', projects: true, applications: ['opencode', 'codex'], tts: false, stt: false, autoScreen: process.env.JARVIS_AUTO_SCREEN !== '0' })
+    if (req.method === 'GET' && url.pathname === '/health') return json(200, { ok: true, brain: 'opencode', projects: true, applications: ['opencode', 'codex'], tts: false, stt: false, screenOptIn: true, recordingControlVersion: 1, autoScreen: process.env.JARVIS_AUTO_SCREEN !== '0' })
     if (req.method === 'GET' && url.pathname === '/projects') return json(200, { projects: await projects.list(), defaultServerURL: projects.serverURL })
     if (req.method === 'POST' && url.pathname === '/projects') return json(200, { project: await projects.open(await body(req)) })
     if (req.method === 'POST' && url.pathname === '/projects/browse') {
@@ -259,7 +259,7 @@ wss.on('connection', async (socket, req) => {
       reply: (id, reply) => api('POST', `/permission/${encodeURIComponent(id)}/reply`, { reply }),
       publish: requests => send({ type: 'permissions', requests }), publishMode: policy => send({ type: 'permission_mode', policy }) })
     send({ type: 'ready', servers: ['opencode', project.name], conversation: { id: session.id, title: session.title,
-      resumed: choice !== 'new', entries: await conversations.list(), turns: transcript(await api('GET', `/session/${session.id}/message`)) }, native: true })
+      resumed: choice !== 'new', entries: await conversations.list(), turns: transcript(await api('GET', `/session/${session.id}/message`)) }, native: true, capabilities: { screenOptIn: true, recordingControlVersion: 1 } })
     connectingSpan.end()
     if (gone) return
     send({ type: 'recording', recording: recorder.snapshot() })
@@ -302,7 +302,7 @@ wss.on('connection', async (socket, req) => {
       }
       session = operation ? await measured('bridge.membership', operation.traceId, () => conversations.checked(session.id)) : await conversations.checked(session.id)
       if (gone || operation?.controller.signal.aborted) return
-      if (msg.type === 'recording' && typeof msg.active === 'boolean') { await recorder.setActive(msg.active); send({ type: 'recording', recording: recorder.snapshot() }); return }
+      if (msg.type === 'recording' && typeof msg.active === 'boolean') { await recorder.setActive(msg.active, { microphone: msg.microphone !== false }); send({ type: 'recording', requestID: msg.requestID, recording: recorder.snapshot() }); return }
       if (msg.type === 'session_list') { send({ type: 'session_list', entries: await conversations.list() }); return }
       if (msg.type === 'session_delete' && msg.id === session.id) {
         if (await conversations.remove(msg.id) !== true) throw new Error('OpenCode no confirmó el borrado.')
@@ -355,7 +355,7 @@ wss.on('connection', async (socket, req) => {
         selection = { ...(selection.agent ? { agent: selection.agent } : {}), model: selected.model, ...(selected.variant ? { variant: selected.variant } : {}) }; image = selected.image
       } else {
         // Inspection cannot change the agent, model or reasoning selected by OpenCode.
-        if (process.env.JARVIS_AUTO_SCREEN !== '0') image = await nativeVision(inspect, session, selection)
+        if (typeof msg.screen === 'boolean' ? msg.screen : process.env.JARVIS_AUTO_SCREEN !== '0') image = await nativeVision(inspect, session, selection)
       }
       selectionSpan.end()
       } catch (error) { selectionSpan.end('error'); throw error }
@@ -378,7 +378,8 @@ wss.on('connection', async (socket, req) => {
       if (gone || own !== current) return
       session = await conversations.checked(session.id)
       let screenFailed = false
-      const screenSpan = !current.preserveOnly && image && process.env.JARVIS_AUTO_SCREEN !== '0' ? timing.start('screen.capture', current.traceId) : null
+      if (msg.screen === true && !current.preserveOnly && !image) send({ type: 'screen', ask: current.id, state: 'unsupported', message: 'El modelo seleccionado no admite imágenes; no se adjuntó una captura.' })
+      const screenSpan = !current.preserveOnly && image && (typeof msg.screen === 'boolean' ? msg.screen : process.env.JARVIS_AUTO_SCREEN !== '0') ? timing.start('screen.capture', current.traceId) : null
       let visual
       try { visual = screenSpan ? await screenPrompt(text, {
         signal, attach: (image, options) => media.then(files => files.attach(image, options)),
@@ -428,7 +429,7 @@ wss.on('connection', async (socket, req) => {
       if (msg.type === 'interrupt') send({ type: 'interrupted', requestID: msg.requestID, status: 'error' })
       endOperation(operation, operation?.controller.signal.aborted ? 'cancelled' : 'error')
       if (operation) { if (own === operation) own = null; release(operation) }
-      if (!operation?.controller.signal.aborted) send({ type: ['session_list','session_delete'].includes(msg.type) ? 'session_error' : 'error', ask: msg.id, message: publicError(error) })
+      if (!operation?.controller.signal.aborted) send({ type: ['session_list','session_delete'].includes(msg.type) ? 'session_error' : msg.type === 'recording' ? 'status_error' : 'error', requestID: msg.requestID, ask: msg.id, message: publicError(error) })
     } finally {
       operation?.finishPreparation?.()
       if (operation && (gone || operation.controller.signal.aborted)) endOperation(operation, gone ? 'detached' : 'cancelled')

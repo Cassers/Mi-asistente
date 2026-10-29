@@ -12,10 +12,11 @@ export const TARGET_FPS = 2
 export const frameDelayMs = (elapsedMs, fps = TARGET_FPS) => Math.max(0, 1000 / fps - elapsedMs)
 
 export class Recorder {
-  constructor(root = HISTORY_ROOT, timing = null) {
+  constructor(root = HISTORY_ROOT, timing = null, { runCommand = run, spawnProcess = spawn, outputs = monitorOutputs } = {}) {
+    this.run = runCommand; this.spawn = spawnProcess; this.outputs = outputs
     this.root = root
     this.timing = timing
-    this.state = { active: false, root, fps: 0, targetFps: TARGET_FPS, retentionMinutes: 30, audio: ['mic', 'system'], error: '' }
+    this.state = { active: false, controlVersion: 1, root, fps: 0, targetFps: TARGET_FPS, retentionMinutes: 30, audio: ['mic', 'system'], error: '' }
     this.children = new Set()
     this.queue = Promise.resolve()
     this.maintenance = setInterval(() => {
@@ -40,25 +41,36 @@ export class Recorder {
     await rename(tmp, join(this.root, 'status.json'))
     })
   }
-  setActive(on) {
-    this.queue = this.queue.catch(() => {}).then(() => this.measure('history.toggle', () => on ? this.start() : this.stop()))
+  setActive(on, { microphone = true } = {}) {
+    this.queue = this.queue.catch(() => {}).then(() => this.measure('history.toggle', async () => {
+      try { return await (on ? this.start({ microphone }) : this.stop()) }
+      catch (error) {
+        this.state.error = error.message
+        await this.stop().catch(() => {})
+        throw error
+      }
+    }))
     return this.queue
   }
-  async start() {
-    if (this.state.active) return
-    const output = (await monitorOutputs()).principal
+  async start({ microphone = true } = {}) {
+    const audio = microphone ? ['mic', 'system'] : ['system']
+    if (this.state.active) {
+      if (this.state.audio.includes('mic') === microphone) return
+      await this.stop()
+    }
+    const output = (await this.outputs()).principal
     if (!output) throw new Error('Monitor principal no disponible')
-    const mic = (await run('pactl', ['get-default-source'], { timeout: 3000 })).stdout.trim()
-    const sink = (await run('pactl', ['get-default-sink'], { timeout: 3000 })).stdout.trim()
-    if (!mic || mic.endsWith('.monitor') || !sink) throw new Error('No hay micrófono/salida predeterminados válidos')
+    const mic = microphone ? (await this.run('pactl', ['get-default-source'], { timeout: 3000 })).stdout.trim() : null
+    const sink = (await this.run('pactl', ['get-default-sink'], { timeout: 3000 })).stdout.trim()
+    if (microphone && (!mic || mic.endsWith('.monitor')) || !sink) throw new Error('No hay micrófono/salida predeterminados válidos')
     this.session = join(this.root, `session-${Date.now()}-${randomBytes(4).toString('hex')}`)
     await mkdir(join(this.session, 'frames'), { recursive: true, mode: 0o700 })
     await mkdir(join(this.session, 'audio'), { mode: 0o700 })
-    this.state = { ...this.state, active: true, fps: 0, frames: 0, startedAt: Date.now(), error: '', monitor: output }
+    this.state = { ...this.state, active: true, audio, fps: 0, frames: 0, startedAt: Date.now(), error: '', monitor: output }
     this.controller = new AbortController()
     await writeFile(join(this.session, 'session.json'), JSON.stringify({ ...this.state, mic, system: `${sink}.monitor` }), { mode: 0o600 })
-    for (const [name, source] of [['mic', mic], ['system', `${sink}.monitor`]]) {
-      const child = spawn('ffmpeg', ['-nostdin', '-v', 'error', '-f', 'pulse', '-i', source,
+    for (const [name, source] of [...(microphone ? [['mic', mic]] : []), ['system', `${sink}.monitor`]]) {
+      const child = this.spawn('ffmpeg', ['-nostdin', '-v', 'error', '-f', 'pulse', '-i', source,
         '-ac', '1', '-ar', '16000', '-c:a', 'libopus', '-b:a', '32k', '-f', 'segment',
         '-segment_time', String(CLIP_SECONDS), '-reset_timestamps', '1', '-strftime', '1',
         join(this.session, 'audio', `${name}-%s.ogg`)], { stdio: ['ignore', 'ignore', 'pipe'] })

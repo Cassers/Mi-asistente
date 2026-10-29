@@ -272,3 +272,24 @@ test('native request capabilities isolate runtime, thread and RPC id type; stale
   assert.equal(oldState.policy.pending.size, 0)
   assert.equal(old.runtime.requests.has(oldId), false)
 })
+
+
+test('explicit screen opt-in overrides launcher off and attaches a fresh image to each native turn', async t => {
+  let captures = 0
+  const f = await fixture(t, { autoScreen: false, screen: async (text, options) => {
+    options.onState('attached')
+    return { parts: [{ type: 'file', url: 'data:image/png;base64,' + Buffer.from('fixture-' + ++captures).toString('base64') }], context: 'captura actual' }
+  } })
+  const state = await f.runtime.open('thr-a')
+  for (const screen of [true, true, false]) {
+    await f.runtime.ask(state, { ...ask(), model: 'codex-image', screen })
+    const params = f.rpc.calls.filter(c => c.method === 'turn/start').at(-1).params
+    assert.equal(params.input.filter(part => part.type === 'image').length, screen ? 1 : 0)
+    if (screen) assert.equal(Buffer.from(params.input.find(part => part.type === 'image').url.split(',')[1], 'base64').toString(), 'fixture-' + captures)
+    assert.equal(params.developerInstructions, undefined)
+    await f.runtime.interrupt(state)
+  }
+  assert.equal(captures, 2)
+  await f.runtime.ask(state, { ...ask(), model: 'codex-text', screen: true })
+  assert.equal(captures, 2, 'text-only models must never trigger capture')
+})

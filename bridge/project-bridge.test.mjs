@@ -29,7 +29,7 @@ async function until(read, description, timeout = 5000) {
 const user = (id, text) => ({ info: { id, role: 'user' }, parts: [{ type: 'text', text }] })
 const answer = (id, parentID, text) => ({ info: { id, parentID, role: 'assistant', time: { completed: Date.now() } }, parts: [{ type: 'text', text }] })
 
-async function fixture(t) {
+async function fixture(t, { screenFixture } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'jarvis-project-bridge-test-'))
   const directories = [join(root, 'project'), join(root, 'project/nested')]
   for (const directory of directories) await mkdir(directory, { recursive: true })
@@ -134,6 +134,13 @@ async function fixture(t) {
   await writeFile(join(root, 'data/opencode/auth.json'), JSON.stringify({ 'opencode-go': { type: 'api', key: 'fixture-only' } }))
   const preload = join(root, 'local-audio-provider.mjs')
   await writeFile(preload, `const original=globalThis.fetch;globalThis.fetch=(url,options)=>String(url).startsWith('https://opencode.ai/inference/go/')?original(${JSON.stringify(`http://127.0.0.1:${mock.address().port}/audio-transcribe`)},options):original(url,options);`)
+  if (screenFixture) {
+    const desktopURL = new URL('./desktop.mjs', import.meta.url).href
+    const source = screenFixture === 'fail'
+      ? "export async function captureDesktop() { throw new Error('Fixture capture denied') }"
+      : "let count=0; export async function captureDesktop(monitor) { if(monitor!=='principal') throw Error('Wrong fixture monitor'); return {mimeType:'image/png',data:Buffer.from('fixture-screen-'+ ++count).toString('base64')} }"
+    await writeFile(preload, (await readFile(preload, 'utf8')) + `\nimport {registerHooks} from 'node:module';registerHooks({load(url,context,next){if(url===${JSON.stringify(desktopURL)}) return {format:'module',shortCircuit:true,source:${JSON.stringify(source)}};return next(url,context)}});`)
+  }
   child = spawn(process.execPath, ['--import', pathToFileURL(preload).href, fileURLToPath(new URL('./project-bridge.mjs', import.meta.url))], {
     cwd: root,
     env: { ...process.env, HOME: root, XDG_DATA_HOME: join(root, 'data'), XDG_STATE_HOME: join(root, 'state'), XDG_CONFIG_HOME: join(root, 'config'), TMPDIR: root,
@@ -175,6 +182,7 @@ async function fixture(t) {
   }
   return { root, base, registry, directories, projects, requests, messages, sessions, connect, emit,
     enableDirect: () => { directAdapter = true; model.capabilities.input.audio = true; nativeProvider = 'opencode-go'; model.api.npm = '@ai-sdk/openai'; model.api.url = 'https://opencode.ai/inference/go/openai/v1' },
+    setImageSupport: value => { model.capabilities.input.image = value },
     setAudioSupport: value => { model.capabilities.input.audio = value; nativeProvider = 'opencode-go' },
     setTransport: npm => { model.api.npm = npm; model.api.url = 'https://opencode.ai/inference/go/' + (npm === '@ai-sdk/google' ? 'google/v1beta' : 'openai/v1') },
     setAudioResponse: (status, text = '') => { audioStatus = status; audioText = text },
@@ -769,4 +777,44 @@ test('native child permissions require checked same-directory ancestry; foreign,
   assert.deepEqual(f.forbidden().map(r => [r.path, r.data]), [['/permission/per_grandchild/reply', { reply: 'once' }]])
   await a.close(); await b.close(); await sleep(150)
   assert.equal(f.forbidden().length, 1, 'pending native permissions survive detach')
+})
+
+
+test('OpenCode explicit screen opt-in sends fresh file parts, respects off/text-only and never starts history', async t => {
+  const f = await fixture(t, { screenFixture: 'ok' }); f.setImageSupport(true)
+  const client = await f.connect(f.projects[0])
+  assert.equal(client.frames.find(frame => frame.type === 'ready').capabilities.screenOptIn, true)
+  assert.equal((await (await fetch(f.base + '/health')).json()).screenOptIn, true)
+  for (const [index, screen] of [true, true, false].entries()) {
+    const id = 'screen-fixture-' + index
+    client.send({ type: 'ask', id, text: 'Mira mi pantalla', audioMode: 'transcript', screen })
+    await client.frame(frame => frame.type === 'done' && frame.ask === id)
+    const payload = f.requests.filter(r => r.path.endsWith('/prompt_async')).at(-1).data
+    const images = payload.parts.filter(part => part.type === 'file')
+    assert.equal(images.length, screen ? 1 : 0)
+    if (screen) {
+      assert.equal(images[0].mime, 'image/png')
+      assert.equal(await readFile(fileURLToPath(images[0].url), 'utf8'), 'fixture-screen-' + (index + 1))
+      assert.ok(client.frames.some(frame => frame.type === 'screen' && frame.ask === id && frame.state === 'attached'))
+    }
+    assert.equal(payload.system, undefined); assert.equal(payload.agent, undefined)
+  }
+  f.setImageSupport(false)
+  client.send({ type: 'ask', id: 'text-only-screen', text: 'Texto', audioMode: 'transcript', screen: true })
+  await client.frame(frame => frame.type === 'done' && frame.ask === 'text-only-screen')
+  assert.ok(client.frames.some(frame => frame.type === 'screen' && frame.ask === 'text-only-screen' && frame.state === 'unsupported'))
+  assert.equal(f.requests.filter(r => r.path.endsWith('/prompt_async')).at(-1).data.parts.some(part => part.type === 'file'), false)
+  client.send({ type: 'recording', active: false, requestID: 'pause-fixture-history' })
+  const ack = await client.frame(frame => frame.requestID === 'pause-fixture-history')
+  assert.equal(ack.type, 'recording'); assert.equal(ack.recording.active, false); assert.equal(ack.recording.controlVersion, 1)
+  assert.equal(client.frames.some(frame => frame.type === 'recording' && frame.recording.active), false)
+})
+test('OpenCode failed screen capture sends text without file and reports failed rather than attached', async t => {
+  const f = await fixture(t, { screenFixture: 'fail' }); f.setImageSupport(true)
+  const client = await f.connect(f.projects[0])
+  client.send({ type: 'ask', id: 'failed-fixture-screen', text: 'Mira mi pantalla', audioMode: 'transcript', screen: true })
+  await client.frame(frame => frame.type === 'done' && frame.ask === 'failed-fixture-screen')
+  assert.ok(client.frames.some(frame => frame.type === 'screen' && frame.state === 'failed'))
+  assert.equal(client.frames.some(frame => frame.type === 'screen' && frame.state === 'attached'), false)
+  assert.equal(f.requests.filter(r => r.path.endsWith('/prompt_async')).at(-1).data.parts.some(part => part.type === 'file'), false)
 })

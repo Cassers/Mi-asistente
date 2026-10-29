@@ -70,6 +70,14 @@ arranque nativo. La instalación opcional se documenta en
 - Captura actual e historial local opcionales. Las funciones de escritorio
   requieren Linux con niri/Wayland, grim, ffmpeg y pactl. Arranque con captura e
   historial apagados; encenderlos exige una elección explícita.
+  Usa **Compartir pantalla · Activar** para adjuntar una captura actual del monitor
+  principal en cada pregunta, solo con modelos que admitan imágenes. No enciende
+  el micrófono ni la grabación continua; se desactiva al recargar, desconectar o cambiar de proyecto o chat.
+  **Historial pausado · Reanudar** funciona también en espera de activación.
+  El historial guarda pantalla, micrófono y sonido del PC: apagar el micrófono
+  lo pausa. Puedes **Reanudar sin micrófono** para guardar solo pantalla y sonido
+  del PC, manteniendo el micrófono del asistente apagado. El botón espera
+  confirmación del bridge y permite reintentar si falla.
 - Panel de tiempos locales sin contenido de mensajes, imágenes, audio o claves.
 
 Consulta [proyectos nativos](docs/project-client.md),

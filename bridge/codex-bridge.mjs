@@ -32,11 +32,11 @@ export async function attachCodexClient(socket, { project, manager, recorder, ti
         const accepted = state.policy.setMode(msg.mode, msg.confirmed)
         send({ type: 'permission_mode', requestID: msg.requestID, policy: { ...state.policy.snapshot(), ...(!accepted ? { error: 'Modo inválido o sin confirmación.' } : {}) } })
       } else if (msg.type === 'recording' && typeof msg.active === 'boolean' && recorder) {
-        await recorder.setActive(msg.active); send({ type: 'recording', recording: recorder.snapshot() })
+        await recorder.setActive(msg.active, { microphone: msg.microphone !== false }); send({ type: 'recording', requestID: msg.requestID, recording: recorder.snapshot() })
       }
     } catch (error) {
       // Runtime errors contain adapter-owned text; native RPC rejects never expose raw stderr/config.
-      send({ type: msg.type === 'session_list' || msg.type === 'session_delete' ? 'session_error' : msg.type === 'ask' ? 'error' : 'status_error', ask: msg.id, message: error.message })
+      send({ type: msg.type === 'session_list' || msg.type === 'session_delete' ? 'session_error' : msg.type === 'ask' ? 'error' : 'status_error', requestID: msg.requestID, ask: msg.id, message: error.message })
       if (msg.type === 'interrupt') send({ type: 'interrupted', requestID: msg.requestID, status: 'error' })
     }
   }
@@ -53,7 +53,7 @@ export async function attachCodexClient(socket, { project, manager, recorder, ti
     if (gone) { unsubscribe(); return }
     send({ type: 'ready', servers: ['codex', project.name], application: 'codex', native: true,
       conversation: { id: state.id, title: state.title, resumed: !!choice && choice !== 'new', entries, turns: runtime.transcript(state), busy: runtime.snapshot(state).busy },
-      capabilities: { archive: true, recoverableArchive: true, directAudio: false, transcriptOnly: true, userInput: true } })
+      capabilities: { screenOptIn: true, recordingControlVersion: 1, archive: true, recoverableArchive: true, directAudio: false, transcriptOnly: true, userInput: true } })
     ready = true
     for (const frame of staged) send(frame)
     send(runtime.snapshot(state)); runtime.publishPermissions(state)

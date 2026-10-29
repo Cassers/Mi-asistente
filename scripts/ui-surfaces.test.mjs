@@ -44,6 +44,8 @@ const Settings = component('AssistantSettings', 'AssistantSettings')
 const Listening = component('ListeningControl', 'ListeningControl')
 const Microphone = component('MicrophoneControl', 'MicrophoneControl')
 const VoiceInput = component('VoiceInputControl', 'VoiceInputControl')
+const History = component('CaptureControls', 'HistoryControl')
+const Screen = component('CaptureControls', 'ScreenControl')
 const render = (Component, props) => renderToStaticMarkup(React.createElement(Component, props))
 
 test('voice input choice is labelled, defaults to direct audio, explains interruption and exposes status', () => {
@@ -220,6 +222,7 @@ test('microphone control clearly separates hard capture stop from wake standby',
   assert.match(muted, /Historial pausado/)
   assert.match(muted, /aria-pressed="false"/)
   assert.match(render(Microphone, { ...props, muted: true, historyActive: true }), /esperando confirmación de pausa/)
+  assert.match(render(Microphone, { ...props, muted: true, historyActive: true, historyMicrophone: false }), /Historial activo sin micrófono/)
   assert.match(render(Microphone, { ...props, busy: true }), /disabled=""/)
 })
 
@@ -278,4 +281,27 @@ test('Codex voice policy stays transcription-only for compatible, unsupported an
     assert.match(html, /Audio directo deshabilitado/)
     assert.doesNotMatch(html, /Audio directo: cada pausa/)
   }
+})
+
+
+test('history resumes in standby or without microphone after hard off; old bridge stays safely blocked', () => {
+  const recording = { active: false, fps: 0, root: '/fixture', controlVersion: 1 }
+  const standby = render(History, { recording, muted: false })
+  assert.match(standby, /Historial pausado · Reanudar/)
+  assert.doesNotMatch(standby, /disabled=""/)
+  const muted = render(History, { recording, muted: true })
+  assert.doesNotMatch(muted, /disabled=""/)
+  assert.match(muted, /Reanudar sin micrófono/)
+  assert.match(muted, /pantalla y sonido del PC, sin micrófono/)
+  const legacy = render(History, { recording: { ...recording, controlVersion: undefined }, muted: true })
+  assert.match(legacy, /disabled=""/); assert.match(legacy, /Reinicia el puente/)
+  assert.doesNotMatch(render(History, { recording: { ...recording, active: true }, muted: true }), /disabled=""/)
+  assert.match(render(History, { recording: { ...recording, error: 'Captura denegada' }, muted: false }), /role="alert".*Captura denegada/)
+})
+test('per-turn screen control exposes explicit opt-in, privacy scope and disable action', () => {
+  const off = render(Screen, { enabled: false, onChange() {} })
+  assert.match(off, /aria-pressed="false"/); assert.match(off, /Compartir pantalla apagado · Activar/)
+  assert.match(off, /No inicia el historial ni el micrófono/)
+  assert.match(off, /Envía una captura del monitor principal con cada pregunta/)
+  assert.match(render(Screen, { enabled: true, onChange() {} }), /Compartir pantalla activo · Desactivar/)
 })

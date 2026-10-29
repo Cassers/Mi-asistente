@@ -3,13 +3,14 @@ type Props = {
   busy: boolean
   onToggle: () => void
   historyActive: boolean
+  historyMicrophone?: boolean
   inactive?: boolean
   standby?: boolean
   name?: string
   onStandby?: () => void
 }
 
-export function MicrophoneControl({ muted, busy, onToggle, historyActive, inactive = false,
+export function MicrophoneControl({ muted, busy, onToggle, historyActive, historyMicrophone = true, inactive = false,
   standby = false, name = 'Asistente', onStandby }: Props) {
   const off = muted || inactive
   const wakeControl = !!onStandby && !off
@@ -28,7 +29,7 @@ export function MicrophoneControl({ muted, busy, onToggle, historyActive, inacti
         onClick={onToggle} aria-describedby="microphone-hardoff-explanation">Apagar por completo</button>}
     </div>
     <span id="microphone-explanation" role="status">{muted
-      ? `Micrófono apagado: no escucha ni su nombre. La respuesta continúa.${historyActive ? ' Historial: esperando confirmación de pausa…' : ' Historial pausado.'}`
+      ? `Micrófono apagado: no escucha ni su nombre. La respuesta continúa.${historyActive ? historyMicrophone ? ' Historial: esperando confirmación de pausa…' : ' Historial activo sin micrófono: pantalla y sonido del PC.' : ' Historial pausado.'}`
       : inactive
         ? 'Activa la voz para usar el micrófono. Abrir proyectos no inicia captura de audio.'
         : wakeControl

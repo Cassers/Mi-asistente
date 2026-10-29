@@ -11,10 +11,11 @@ const policy = {}
 vm.runInNewContext(compile(readFileSync(new URL('../src/lib/listening-policy.ts', import.meta.url), 'utf8')), { exports: policy })
 const text = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8')
 const source = ts.createSourceFile('App.tsx', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
-const needed = new Set(['goDormant', 'pauseConversation', 'pauseHistoryForPrivacy', 'toggleMicrophone', 'toggleStandby', 'startCapture', 'mode', 'onWake', 'onSpeechStart', 'onUtterance', 'onPartial', 'sendTranscript', 'onKey'])
+const needed = new Set(['goDormant', 'pauseConversation', 'pauseHistoryForPrivacy', 'toggleMicrophone', 'toggleStandby', 'startCapture', 'mode', 'onWake', 'onSpeechStart', 'onUtterance', 'onPartial', 'sendTranscript', 'onKey', 'onRecording'])
 const declarations = new Map()
 function visit(node) {
   if (ts.isVariableDeclaration(node) && needed.has(node.name.getText(source))) declarations.set(node.name.getText(source), node.initializer.getText(source))
+  if (ts.isCallExpression(node) && node.expression.getText(source) === 'watchRecording') declarations.set('onRecording', node.arguments[0].getText(source))
   ts.forEachChild(node, visit)
 }
 visit(source)
@@ -23,7 +24,7 @@ function harness(configured = true, capturedClip) {
   let consumed = 0
   const events = [], questions = []
   const state = { phase: 'speaking', conversationPaused: false, microphoneMuted: false, microphoneActive: true, microphoneStandby: false, microphoneBusy: false, caption: 'old partial', activeTool: 'read', screenCapture: 'attached' }
-  for (const [method, property] of [['setPhase','phase'],['setConversationPaused','conversationPaused'],['setCaption','caption'],['setActiveTool','activeTool'],['setScreenCapture','screenCapture'],['setMicrophoneMuted','microphoneMuted'],['setMicrophoneActive','microphoneActive'],['setMicrophoneStandby','microphoneStandby'],['setMicrophoneBusy','microphoneBusy'],['setLevel','level']]) state[method] = value => { state[property] = value }
+  for (const [method, property] of [['setPhase','phase'],['setConversationPaused','conversationPaused'],['setCaption','caption'],['setActiveTool','activeTool'],['setScreenCapture','screenCapture'],['setMicrophoneMuted','microphoneMuted'],['setMicrophoneActive','microphoneActive'],['setMicrophoneStandby','microphoneStandby'],['setMicrophoneBusy','microphoneBusy'],['setLevel','level'],['setRecording','recording']]) state[method] = value => { state[property] = value }
   state.setError = () => {}
   const profile = { ...DEFAULT_PROFILE, configured, name: 'Diógenes' }
   const context = { currentVoiceInputMode: () => state.inputMode || 'transcript', followup: { current: false }, activeTurnTiming: { current: null }, ...voiceTimingStub(), store: { getState: () => state }, turn: { current: 10 }, clearIdle: () => events.push('clearIdle'),
@@ -227,4 +228,27 @@ test('Codex transcript wake-name plus question consumes available PCM and forwar
   assert.equal(app.responseInputs[0][1], undefined)
   assert.equal(app.responseInputs[0][2], 'wake-trace')
   assert.equal(app.state.microphoneStandby, false)
+})
+
+
+test('explicit resume in standby survives recording status updates; hard mute still enforces privacy', async () => {
+  const app = harness(); app.toggleStandby()
+  app.events.length = 0
+  app.onRecording({ active: true, fps: 2 })
+  assert.equal(app.state.recording.active, true)
+  assert.equal(app.state.microphoneStandby, true)
+  assert.ok(!app.events.includes('pauseHistory'))
+  await app.toggleMicrophone(); app.events.length = 0
+  app.onRecording({ active: true, fps: 2 })
+  assert.ok(app.events.includes('pauseHistory'))
+  assert.ok(!app.events.includes('startCapture'))
+})
+
+
+test('history without a mic survives privacy status checks without waking the assistant', async () => {
+  const app = harness(); await app.toggleMicrophone(); app.events.length = 0
+  app.onRecording({ active: true, audio: ['system'], controlVersion: 1 })
+  assert.equal(app.state.recording.active, true); assert.equal(app.state.microphoneMuted, true)
+  assert.equal(app.state.microphoneActive, false)
+  assert.ok(!app.events.includes('pauseHistory')); assert.ok(!app.events.includes('startCapture'))
 })

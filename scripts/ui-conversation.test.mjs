@@ -74,6 +74,9 @@ function harness() {
     './Effects': { Effects: () => null }, './Pointer': { Pointer: () => null }, './GestureGuide': { GestureGuide: () => null },
   }
   for (const name of ['ModelPicker', 'AssistantSettings', 'ConversationCard', 'ProjectPicker', 'TimingsPanel']) mocks[`./${name}`] = { [name]: panel(name) }
+  const captures = {}
+  vm.runInNewContext(compile('CaptureControls'), { exports: captures, require: id => mocks[id] || require(id) })
+  mocks['./CaptureControls'] = captures
   const cache = {}
   function load(name) {
     if (cache[name]) return cache[name]

@@ -335,7 +335,8 @@ export class CodexRuntime extends EventEmitter {
         text = '[Audio adjunto]\n' + audioPrompt + (state.interruptions ? '\n\n' + continuationPrompt : '')
         input = [{ type: 'text', text, text_elements: [] }]
       }
-      if (this.autoScreen && selected?.inputModalities?.includes('image')) {
+      if (message.screen === true && !selected?.inputModalities?.includes('image')) this.publish(state, { type: 'screen', ask: op.ask, state: 'unsupported', message: 'El modelo seleccionado no admite imágenes; no se adjuntó una captura.' })
+      if ((typeof message.screen === 'boolean' ? message.screen : this.autoScreen) && selected?.inputModalities?.includes('image')) {
         const visual = await this.screen(text, { signal: op.controller.signal, onState: status => this.publish(state, { type: 'screen', ask: op.ask, state: status }) })
         input = [{ type: 'text', text: text + (visual.context ? '\n\n' + visual.context : ''), text_elements: [] },
           ...visual.parts.filter(p => p.type === 'file').map(p => ({ type: 'image', url: p.url }))]

@@ -10,7 +10,7 @@ import { BladeSweep, Blades } from './Blades'
 import { Effects } from './Effects'
 import { Pointer } from './Pointer'
 import { GestureGuide } from './GestureGuide'
-import { setRecordingActive } from '../lib/brain'
+import { HistoryControl, ScreenControl } from './CaptureControls'
 import { useProfile, displayName, wakeWord } from '../lib/profile'
 import { useVoiceInputMode } from '../lib/voice-input-mode'
 
@@ -69,6 +69,7 @@ export function Hud({ onPause, onResume, onToggleMicrophone, onToggleStandby, on
   const looking = useStore((s) => s.looking)
   const screenCapture = useStore((s) => s.screenCapture)
   const recording = useStore((s) => s.recording)
+  const autoScreen = useStore((s) => s.autoScreen)
   const ui = useStore((s) => s.ui)
   const transcriptPending = inputMode === 'transcript' && phase === 'listening' && microphoneActive && !microphoneMuted && !microphoneStandby && !conversationPaused && !!caption.trim() && !!onSubmitTranscript
 
@@ -239,21 +240,12 @@ export function Hud({ onPause, onResume, onToggleMicrophone, onToggleStandby, on
             <MicrophoneControl muted={microphoneMuted} busy={microphoneBusy || phase === 'boot'}
               inactive={!microphoneActive || phase === 'boot'}
               standby={microphoneStandby} name={wakeWord(profile)} onStandby={onToggleStandby}
-              historyActive={recording?.active !== false} onToggle={onToggleMicrophone} />
+              historyActive={recording?.active !== false} historyMicrophone={recording?.audio?.includes('mic') !== false} onToggle={onToggleMicrophone} />
             <ListeningControl paused={conversationPaused} muted={microphoneMuted || !microphoneActive} standby={microphoneStandby}
               disabled={phase === 'offline' || phase === 'boot' || microphoneMuted && conversationPaused}
               name={wakeWord(profile)} onPause={onPause} onResume={onResume} />
-            {recording && (
-              <button type="button" aria-pressed={recording.active}
-                disabled={(microphoneMuted || microphoneStandby) && !recording.active}
-                style={{ pointerEvents: 'auto', color: 'inherit', background: 'transparent', border: '1px solid currentColor', padding: '6px 10px', cursor: 'pointer', font: 'inherit' }}
-                onClick={() => { void setRecordingActive(!recording.active).catch((err: Error) => useStore.getState().setError(err.message)) }}
-                title={recording.error || 'Capturas + micrófono + sonido del PC. Se conservan los últimos 30 minutos.'}>
-                {recording.error ? '⚠ ' : recording.active ? '● ' : ''}
-                {recording.active ? 'Historial activo · Pausar' : 'Historial pausado · Reanudar'}
-                {recording.error && ` · ${recording.error}`}
-              </button>
-            )}
+            {recording && <HistoryControl recording={recording} muted={microphoneMuted} />}
+            <ScreenControl enabled={autoScreen} available={recording?.controlVersion === 1} onChange={(enabled) => useStore.getState().setAutoScreen(enabled)} />
             {screenCapture !== 'off' && <span className="capture-status" role="status">{screenCapture === 'capturing'
               ? 'Capturando monitor…' : screenCapture === 'attached' ? 'Captura adjunta' : 'Sin captura del monitor'}</span>}
           </footer>
