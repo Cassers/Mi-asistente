@@ -26,6 +26,7 @@ const button = (tree, label) => nodes(tree).find(node => node.type === 'button' 
 // No browser, capture, bridge connection or model is created by this harness.
 function harness() {
   const slots = []
+  let storeHookCalls = 0
   let cursor = 0, effects = [], tree, resize, renderAgain = false
   const state = { phase: 'speaking', conversationPaused: false, microphoneMuted: false, microphoneStandby: false,
     microphoneActive: true, microphoneBusy: false, caption: '', turns: turns('session', 12), activeTool: null, error: null,
@@ -49,7 +50,7 @@ function harness() {
   const hooks = {
     ...React,
     useRef(initial) { const i = cursor++; return slots[i] ||= { current: initial } },
-    useState(initial) { const i = cursor++; if (!(i in slots)) slots[i] = initial
+    useState(initial) { const i = cursor++; if (!(i in slots)) slots[i] = typeof initial === 'function' ? initial() : initial
       return [slots[i], value => { const next = typeof value === 'function' ? value(slots[i]) : value
         if (!Object.is(next, slots[i])) { slots[i] = next; renderAgain = true } }] },
     useEffect: effect, useLayoutEffect: effect,
@@ -60,15 +61,17 @@ function harness() {
     react: hooks,
     'framer-motion': { AnimatePresence: ({ children }) => children,
       motion: { div: ({ initial: _initial, animate: _animate, exit: _exit, transition: _transition, ...props }) => React.createElement('div', props) } },
-    '../store': { useStore: selector => selector(state), accentFor: () => '#67e8e3' },
+    '../store': { useStore: selector => { storeHookCalls++; return selector(state) }, accentFor: () => '#67e8e3' },
     '../lib/profile': { useProfile: () => ({ configured: true, name: 'Diógenes' }), displayName: () => 'Diógenes', wakeWord: () => 'Diógenes' },
-    '../lib/voice-input-mode': { useVoiceInputMode: () => 'transcript' },
+    '../lib/whisper': { useWhisperCapabilities: () => ({ state: 'unavailable', capabilities: null, error: 'Whisper no configurado en este fixture.' }),
+      refreshWhisper: async () => { throw Error('fixture unavailable') }, subscribeWhisperInvalidation: () => () => {}, whisperAccept: () => '', transcribeWhisper: () => assert.fail('fixture must never transcribe') },
+    '../lib/voice-input-mode': { useVoiceInputMode: () => 'transcript', useVoiceInputStatus: () => '' },
     '../lib/brain': { setRecordingActive: () => assert.fail('must not record'), usingBridge: true },
-    '../lib/projects': { useProjects: () => ({ available: true }) },
+    '../lib/projects': { useProjects: () => ({ available: state.projectAvailable !== false }) },
     '../lib/models': { useModels: () => ({ models: [], model: '', variant: '' }), chooseModel: noop, refreshModels: noop },
     '../lib/speech-settings': { useSpeechRate: () => 1, setSpeechRate: noop, resetSpeechRate: noop },
     '../lib/bridge': { permissionModeSnapshot: () => ({ mode: 'manual', connected: true }), subscribePermissionMode: noop,
-      setPermissionMode: noop, conversationSnapshot: () => ({ chat: { id: 'one', entries: [] }, error: '' }),
+      setPermissionMode: noop, conversationSnapshot: () => ({ chat: state.conversation === undefined ? { id: 'one', entries: [] } : state.conversation, error: '' }),
       subscribeConversation: noop, chooseConversation: noop, deleteConversation: noop, refreshConversations: noop },
     './Suggestions': { Suggestions: () => null }, './Blades': { Blades: () => null, BladeSweep: () => null },
     './Effects': { Effects: () => null }, './Pointer': { Pointer: () => null }, './GestureGuide': { GestureGuide: () => null },
@@ -89,9 +92,9 @@ function harness() {
     return cache[name] = exports[name]
   }
   return {
-    state, viewport, dialog, load,
+    state, viewport, dialog, load, get storeHookCount() { return storeHookCalls },
     render(name = 'Hud', props = {}) {
-      cursor = 0; effects = []; renderAgain = false
+      cursor = 0; effects = []; renderAgain = false; storeHookCalls = 0
       tree = load(name)({ onPause: noop, onResume: noop, onToggleMicrophone: noop, ...props })
       for (const node of nodes(tree)) {
         if (!node.props?.ref) continue
@@ -468,4 +471,11 @@ test('composer keeps its pending draft on initial chat readiness but isolates dr
   assert.equal(child, switchedInstance)
   assert.equal(textarea(tree).props.value, 'borrador del nuevo chat', 'old acceptance cannot clear the new destination draft')
   assert.equal(tree.props['aria-busy'], false)
+})
+
+test('settings capability selector keeps stable store hook count through unavailable/legacy recovery',()=>{
+  const app=harness();app.state.conversation=null
+  app.render('ConversationsPanel');const initial=app.storeHookCount
+  app.state.projectAvailable=false;assert.equal(app.render('ConversationsPanel'),null);assert.equal(app.storeHookCount,initial)
+  app.state.projectAvailable=true;app.render('ConversationsPanel');assert.equal(app.storeHookCount,initial)
 })

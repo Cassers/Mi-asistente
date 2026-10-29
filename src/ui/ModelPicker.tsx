@@ -1,4 +1,5 @@
 import { useVoiceInputMode } from '../lib/voice-input-mode'
+import { useProjects } from '../lib/projects'
 import type { Application } from '../lib/projects'
 import type { ModelOption } from '../lib/models'
 import { SearchableModelSelect } from './SearchableModelSelect'
@@ -9,7 +10,8 @@ type Props = { models: ModelOption[]; model: string; variant: string; locked: bo
   onChoose: (model: string, variant?: string) => void; onRefresh: () => void }
 
 export function ModelPicker({ models, model, variant, locked, loading, error, onChoose, onRefresh, application = 'opencode', onApplication }: Props) {
-  const applicationName = application === 'codex' ? 'Codex' : 'OpenCode'
+  const applicationName = ({ opencode: 'OpenCode', codex: 'Codex', claude: 'Claude Code', antigravity: 'Antigravity' } as const)[application]
+  const { applications } = useProjects()
   const voiceInput = useVoiceInputMode(application)
   const selected = models.find(m => m.id === model)
   const directHelp = 'Audio directo: cada pausa envía tu voz al modelo elegido, sin transcribirla antes. Si el modelo o formato no es compatible, se muestra un error; no se sustituye por dictado.'
@@ -19,6 +21,7 @@ export function ModelPicker({ models, model, variant, locked, loading, error, on
       <label htmlFor="assistant-application">Aplicación</label>
       <select id="assistant-application" value={application} disabled={locked || !onApplication} onChange={event => onApplication?.(event.target.value as Application)} aria-describedby="application-description">
         <option value="opencode">OpenCode</option><option value="codex">Codex</option>
+        {(['claude','antigravity'] as Application[]).map(id => { const info = applications?.find(app => app.id === id); return <option key={id} value={id} disabled={!info?.available}>{id === 'claude' ? 'Claude Code' : 'Antigravity'}{info?.available ? '' : ' · No disponible'}</option> })}
       </select>
       <p id="application-description">Conexión local de {applicationName}. Cambiar de aplicación abre esta carpeta con sus propias conversaciones y configuración.</p>
       <span className="surface-eyebrow">PROVEEDORES CONECTADOS</span>
@@ -34,9 +37,10 @@ export function ModelPicker({ models, model, variant, locked, loading, error, on
       <p>{selected?.id === 'native/default' ? `Se conserva la configuración, modelo y razonamiento que resuelva ${applicationName} para esta conversación.` : selected && !selected.variants.length ? `${applicationName} no expone niveles ajustables para este modelo.` : 'Más pensamiento puede aumentar el tiempo de respuesta. Se aplica a tu próxima pregunta.'}</p>
       {selected && <p className={!selected.image ? 'model-picker__warning' : ''}>{selected.id === 'native/default' ? 'La captura depende de la visión disponible en el modelo nativo del proyecto.' : selected.image ? 'Recibe la captura actual al hablar.' : 'Solo texto: no recibirá la captura automática de tu monitor.'}{selected.audio ? ' Admite entrada de audio según el catálogo.' : ''}</p>}
       {selected?.audioReason && <p className="model-picker__warning">{selected.audioReason}</p>}
-      <p>{application === 'codex' ? 'Codex usa solo el dictado del navegador. Audio directo deshabilitado; se envía únicamente texto. El texto escrito funciona con cualquier ajuste de voz.' : voiceInput === 'direct'
+      <p>{application !== 'opencode' ? applicationName + ' recibe solo texto transcrito del navegador o de Whisper local. Audio directo deshabilitado; el texto escrito funciona con cualquier ajuste de voz.' : voiceInput === 'direct'
         ? directHelp
-        : 'Solo transcripción: se envía el texto del dictado del navegador, sin adjuntar el audio. Puedes cambiarlo en «Voz y permisos».'}</p>
+        : voiceInput === 'whisper' ? 'Whisper local: se envía solo el texto reconocido en tu equipo, sin adjuntar el audio.'
+          : 'Solo transcripción: se envía el texto del dictado del navegador, sin adjuntar el audio. Puedes cambiarlo en «Voz y permisos».'}</p>
       {error && <p className="surface-error" role="alert">{error}</p>}
       <button type="button" className="surface-button" disabled={locked || loading} onClick={onRefresh}>Actualizar modelos</button>
     </div>

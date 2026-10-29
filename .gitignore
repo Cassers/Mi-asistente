@@ -20,3 +20,6 @@ public/mediapipe/
 *.key
 auth.json
 cookie
+
+# Motor Whisper local: fuentes y binarios; nunca modelos/audio.
+/.runtime/whisper.cpp/

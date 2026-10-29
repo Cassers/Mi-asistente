@@ -8,7 +8,7 @@ import { ConversationsPanel } from './ui/ConversationsPanel'
 import { useStore } from './store'
 import { type VoiceMode } from './lib/voice'
 import { createMicrophone } from './lib/microphone'
-import { currentVoiceInputMode } from './lib/voice-input-mode'
+import { currentVoiceInputMode, subscribeVoiceInputMode } from './lib/voice-input-mode'
 import { createSpeaker, cycleVoice, currentVoiceName } from './lib/tts'
 import * as sfx from './lib/sfx'
 import * as music from './lib/music'
@@ -41,8 +41,9 @@ import { probeCapabilities } from './lib/capabilities'
 import { env } from './config'
 import { currentProfile, useProfile, refreshProfile, watchProfile, displayName, wakePattern } from './lib/profile'
 import { listeningMode } from './lib/listening-policy'
-import { selectedProject, projectMode, useProjects } from './lib/projects'
-import { conversationSnapshot, conversationRevision, subscribeConversation } from './lib/bridge'
+import { selectedProject, projectMode, useProjects, subscribeProjects } from './lib/projects'
+import { conversationSnapshot, conversationRevision, subscribeConversation, permissionModeSnapshot, subscribePermissionMode } from './lib/bridge'
+import { bindWhisperScope } from './lib/whisper'
 import { timingSpan, timingTrace, timingMark, timingCapture, type TimingSpan } from './lib/voice-timing'
 
 /**
@@ -88,6 +89,10 @@ export default function App() {
   const history = useRef<Msg[]>([])
   const speaker = useRef<ReturnType<typeof createSpeaker> | null>(null)
   const voice = useRef<ReturnType<typeof createMicrophone> | null>(null)
+  useEffect(() => bindWhisperScope(() => ({
+    destination: [selectedProject()?.id || '', selectedProject()?.application || '', conversationRevision(), currentVoiceInputMode()].join(':'),
+    chat: conversationSnapshot().chat?.id, connected: permissionModeSnapshot().connected,
+  }), [subscribeProjects, subscribeConversation, subscribeVoiceInputMode, subscribePermissionMode], () => voice.current?.reset?.()), [])
 
   /**
    * Monotonic turn counter. Every await in a turn checks it on the way out:
@@ -227,7 +232,7 @@ export default function App() {
     s.setPhase('listening')
     // Direct VAD owns the segment boundary, including audio before a fast wake
     // partial. Re-arming here could cut those first phonemes off.
-    if (currentVoiceInputMode() !== 'direct') armUtteranceAudio()
+    if (currentVoiceInputMode() !== 'direct' && currentVoiceInputMode() !== 'whisper') armUtteranceAudio()
     sfx.play('listen')
     idleTimer.current = setTimeout(goDormant, window)
   }
@@ -237,7 +242,7 @@ export default function App() {
   const respond = async (said: string, clip?: VoiceClip, traceId: string | undefined = timingTrace(), inputKind: 'voice' | 'text' = 'voice', acknowledge?: (accepted: boolean) => void): Promise<void> => {
     if (inputKind === 'voice' && !clip) {
       const captured = takeUtteranceAudio()
-      if (currentVoiceInputMode() !== 'transcript') clip = captured
+      if (currentVoiceInputMode() !== 'transcript' && currentVoiceInputMode() !== 'whisper') clip = captured
     }
     const directAudio = !!clip && currentVoiceInputMode() === 'direct'
     if (inputKind === 'voice') {
@@ -271,7 +276,7 @@ export default function App() {
     if (!selectedProject()) s.pushTurn({ id: newId(), role: 'user', text: said })
     s.setPhase('thinking')
     s.setScreenCapture('off')
-    if (inputKind === 'text' || currentVoiceInputMode() === 'transcript') s.setCaption('Enviando mensaje…')
+    if (inputKind === 'text' || currentVoiceInputMode() === 'transcript' || currentVoiceInputMode() === 'whisper') s.setCaption('Enviando mensaje…')
 
     const spk = createSpeaker(traceId, () => turnFirstAudio.end())
     speaker.current = spk
@@ -411,7 +416,7 @@ export default function App() {
       // Name-only activation changes input, never cancels/replaces playback.
       if (!trailing) {
         // Direct VAD keeps the whole current clip even when wake recognition lags.
-        if (currentVoiceInputMode() !== 'direct') voice.current?.reset?.()
+        if (currentVoiceInputMode() !== 'direct' && currentVoiceInputMode() !== 'whisper') voice.current?.reset?.()
         if (!['thinking', 'tooling', 'speaking'].includes(phase)) listen(AWAIT_SPEECH_MS)
         return
       }
@@ -427,9 +432,10 @@ export default function App() {
     }
     if (trailing) markUtteranceAudio()
     const capturedWakeClip = trailing ? takeUtteranceAudio() : undefined
-    const wakeClip = currentVoiceInputMode() === 'transcript' ? undefined : capturedWakeClip
+    const wakeClip = currentVoiceInputMode() === 'transcript' || currentVoiceInputMode() === 'whisper' ? undefined : capturedWakeClip
     store.getState().setConversationPaused(false)
-    voice.current?.reset?.()
+    // Local VAD may already have queued the rest of this spoken question.
+    if (currentVoiceInputMode() !== 'whisper') voice.current?.reset?.()
     store.getState().setError(null)
     sfx.play('wake')
 
@@ -520,7 +526,7 @@ export default function App() {
 
   const sendTranscript = (): boolean => {
     const state = store.getState()
-    if (currentVoiceInputMode() !== 'transcript' || state.microphoneMuted || state.conversationPaused || state.microphoneStandby || state.phase !== 'listening') return false
+    if (!['transcript', 'whisper'].includes(currentVoiceInputMode()) || state.microphoneMuted || state.conversationPaused || state.microphoneStandby || state.phase !== 'listening') return false
     // Commit only the recognizer's pending words, never a status/caption string.
     return voice.current?.commit?.() ?? false
   }

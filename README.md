@@ -1,6 +1,6 @@
 # Mi asistente
 
-Cliente local de voz y texto para **Codex y OpenCode**. Abre una carpeta real y
+Cliente local de voz y texto para **Codex, OpenCode, Claude Code y Antigravity CLI**. Abre una carpeta real y
 continúa sus conversaciones nativas, con sus instrucciones, agentes, modelos,
 skills y permisos. Cada aplicación conserva su cuenta y su historial.
 
@@ -67,6 +67,9 @@ arranque nativo. La instalación opcional se documenta en
 - Modos de entrada de voz: clips directos en rutas compatibles o Solo transcripción.
   Los clips necesitan capacidades y transporte nativos compatibles; un fallo
   directo se muestra sin sustituirlo silenciosamente por dictado.
+- [Whisper local](docs/whisper.md) opcional para convertir grabaciones o archivos
+  en texto en tu equipo, sin proveedor de transcripción ni envío del audio al
+  cliente nativo. Requiere preparar explícitamente el motor y disponer del modelo.
 - Captura actual e historial local opcionales. Las funciones de escritorio
   requieren Linux con niri/Wayland, grim, ffmpeg y pactl. Arranque con captura e
   historial apagados; encenderlos exige una elección explícita.
@@ -84,7 +87,7 @@ Consulta [proyectos nativos](docs/project-client.md),
 [mediciones](docs/performance.md) y [flujo de voz](docs/voice-flow-review-2026-10-26.md).
 Los modelos, permisos, herramientas y modalidades siguen limitados por cada cliente
 nativo y su proveedor. El reconocimiento del navegador puede enviar voz a su
-servicio. Codex usa solo dictado del navegador y envía texto; audio directo está
+servicio. Codex usa solo transcripción (navegador o Whisper local) y envía texto; audio directo está
 deshabilitado. OpenCode conserva su elección de audio directo o transcripción.
 
 ## Configuración local y datos
@@ -138,3 +141,11 @@ Organización de instrucciones inspirada en
 [Mi-agente-agent-system](https://github.com/Cassers/Mi-agente-agent-system).
 Las pistas de Kevin MacLeod tienen licencia CC BY 4.0: conserva los
 [créditos completos](public/audio/CREDITS.md) al redistribuir o publicar vídeos.
+
+### Claude Code y Antigravity
+
+El selector de aplicación detecta los clientes instalados. Claude Code usa el SDK
+nativo y conserva instrucciones, sesiones, texto e imágenes. Antigravity usa
+`agy` con su protocolo oficial de texto; no admite compartir pantalla ni
+aprobaciones interactivas en esa ruta. Ambos conservan su cuenta nativa y usan
+solo dictado del navegador para voz. [Capacidades, límites y pruebas](docs/native-applications.md).

@@ -39,7 +39,7 @@ export function NativeInputPrompt({ request, onReply = replyUserInput }: { reque
         if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
       }}>
-      <h2 id="native-input-title">Codex necesita tu respuesta</h2>
+      <h2 id="native-input-title">{request.metadata?.application === 'claude' ? 'Claude Code' : 'Codex'} necesita tu respuesta</h2>
       <form onSubmit={event => { event.preventDefault(); void respond() }}>
         {!questions.length && <p role="alert">No se pudo mostrar esta solicitud. Puedes cancelarla y continuar conversando.</p>}
         {questions.map((question, index) => <div className="model-picker__body" key={question.id}>

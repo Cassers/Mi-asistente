@@ -2281,3 +2281,71 @@ kbd {
   .conversation-content { gap: 8px; }
   .conversation-pane .hud-top { padding-right: 0; }
 }
+
+
+/* Voice availability, history and per-question sharing use independent sections. */
+.conversation-pane .hud-bottom {
+  display: grid; grid-template-columns: minmax(0, 1.5fr) repeat(2, minmax(0, 1fr));
+  align-items: start; gap: 12px; text-align: left; font-size: 13px;
+}
+.control-section {
+  min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
+  padding: 2px 12px; pointer-events: auto; overflow-wrap: anywhere;
+}
+.control-section + .control-section { border-left: 1px solid #28444f; }
+.control-section__title { margin: 0; color: #9fbec8; font: 600 11px/1.4 system-ui, sans-serif; letter-spacing: .1em; text-transform: uppercase; }
+.conversation-pane .control-state { margin: 0; color: #e2eff2; font: 600 12px/1.5 system-ui, sans-serif; letter-spacing: .03em; }
+.conversation-pane .control-help { display: block; color: #b9cfd6; font: 12px/1.5 system-ui, sans-serif; text-align: left; }
+.control-error { color: #ffb9c1; font: 12px/1.5 system-ui, sans-serif; }
+.conversation-pane .control-section .surface-button { max-width: 100%; white-space: normal; overflow-wrap: anywhere; text-align: center; }
+.conversation-pane .microphone-control, .conversation-pane .listening-control {
+  flex: none; width: 100%; align-items: flex-start; max-width: 100%; gap: 6px;
+}
+.conversation-pane .microphone-actions { justify-content: flex-start; }
+.conversation-pane .microphone-control span { font-size: 12px; text-align: left; }
+.conversation-pane .listening-control { margin-top: 2px; }
+.conversation-pane .transcript-submit { grid-column: 1 / -1; }
+.conversation-pane .status { max-width: 100%; color: #d4eef3; line-height: 1.6; overflow-wrap: anywhere; }
+.conversation-pane .status[data-input='wake'] .dot { background: #ffe0a8; box-shadow: 0 0 10px #bd9253; }
+.conversation-pane .status[data-input='off'] .dot { background: #a9bdc6; box-shadow: none; animation: none; }
+.conversation-pane .control-section .surface-button:focus-visible { outline: 2px solid #78dcec; outline-offset: 2px; }
+@media (max-width: 850px) {
+  .conversation-pane .hud-bottom { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .control-section--voice { grid-column: 1 / -1; padding-bottom: 12px; border-bottom: 1px solid #28444f; }
+  .control-section--voice + .control-section { border-left: 0; }
+}
+@media (max-width: 480px) {
+  .conversation-pane .hud-bottom { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .control-section { padding-inline: 4px; }
+  .control-section + .control-section { border-left: 0; padding-top: 12px; border-top: 1px solid #28444f; }
+  .control-section--voice { padding-bottom: 0; border-bottom: 0; }
+  .conversation-pane .microphone-actions { width: 100%; }
+  .conversation-pane .control-section .surface-button { flex: 1 1 auto; min-height: 44px; }
+}
+
+/* Audio stays a local, editable draft until the normal Send action accepts it. */
+.message-composer--with-audio {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end;
+  max-height: min(46dvh, 420px); overflow-y: auto; overscroll-behavior: contain;
+  scrollbar-color: #527c88 #091923; padding: 2px;
+}
+.message-composer--with-audio > textarea { width: 100%; }
+.audio-attachment, .message-composer--with-audio > .audio-attachment__error { grid-column: 1 / -1; min-width: 0; }
+.audio-attachment { color: #d4e4eb; text-transform: none; letter-spacing: normal; font: 12px/1.5 system-ui, sans-serif; }
+.audio-attachment__actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; min-width: 0; }
+.audio-attachment__scope { color: #bed1d8; flex: 1 1 240px; }
+.audio-attachment__help { margin: 6px 0 0; color: #a9c4ce; overflow-wrap: anywhere; }
+.audio-attachment__picker { position: relative; }
+.audio-attachment__picker input { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; }
+.audio-attachment__picker[data-disabled='true'] { opacity: .5; cursor: not-allowed; }
+.audio-attachment__picker:focus-within { outline: 2px solid #78dcec; outline-offset: 2px; }
+.audio-attachment__review { margin-top: 10px; padding: 12px; border: 1px solid #426570; border-radius: 10px; background: #07151f; }
+.audio-attachment__review p { margin: 0 0 8px; overflow-wrap: anywhere; }
+.audio-attachment__filename { color: #e2eff2; font-weight: 600; }
+.audio-attachment__transcript { display: grid; gap: 6px; margin: 10px 0; }
+.audio-attachment__transcript textarea { width: 100%; min-height: 100px; }
+.audio-attachment__error { color: #ffb9c1; text-transform: none; letter-spacing: normal; font: 12px/1.5 system-ui, sans-serif; overflow-wrap: anywhere; }
+@media (max-width: 480px) {
+  .audio-attachment__scope { flex-basis: 100%; }
+  .audio-attachment__actions .surface-button { min-height: 44px; }
+}

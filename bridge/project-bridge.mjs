@@ -7,6 +7,7 @@ import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { WebSocketServer } from 'ws'
 import { Projects, NativeConversations } from './projects.mjs'
+import { NativeManager } from './native-runtime.mjs'
 import { CodexManager } from './codex-runtime.mjs'
 import { attachCodexClient } from './codex-bridge.mjs'
 import { availableModels, selectModel } from './model-catalog.mjs'
@@ -23,17 +24,20 @@ import { directAudio } from './direct-audio.mjs'
 import { deliverNativeVoice } from './native-voice-delivery.mjs'
 import { recoverVoiceHistory } from './voice-history.mjs'
 import { TimingStore } from './timings.mjs'
+import { whisperRoutes } from './whisper-http.mjs'
 
 const run = promisify(execFile)
 const PORT = Number(process.env.JARVIS_BRIDGE_PORT || 8787)
 const codex = new CodexManager()
-const projects = new Projects({ codex, serverURL: process.env.OPENCODE_URL || 'http://127.0.0.1:4097',
+const native = new NativeManager()
+const projects = new Projects({ codex, native, serverURL: process.env.OPENCODE_URL || 'http://127.0.0.1:4097',
   password: process.env.OPENCODE_SERVER_PASSWORD || '', username: process.env.OPENCODE_SERVER_USERNAME || 'opencode',
   ...(process.env.JARVIS_PROJECT_REGISTRY ? { file: process.env.JARVIS_PROJECT_REGISTRY } : {}) })
 const timingStore = new TimingStore(process.env.JARVIS_TIMINGS_DIR || join(process.env.JARVIS_PROJECT_REGISTRY
   ? dirname(process.env.JARVIS_PROJECT_REGISTRY) : join(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'mi-asistente'), 'timings'))
 const httpTimings = timingStore.recorder()
 const recorder = new Recorder(undefined, httpTimings)
+const whisper = whisperRoutes()
 const traceID = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{8,80}$/.test(value) ? value : randomUUID()
 // A project client never starts recording as a side effect of opening a folder.
 const sessionsSending = new Map()
@@ -79,6 +83,7 @@ const server = http.createServer(async (req, res) => {
   res.once('finish', () => httpSpan?.end(res.statusCode < 400 ? 'ok' : 'error'))
   res.once('close', () => { if (!res.writableFinished) httpSpan?.end('detached') })
   try {
+    if (await whisper.handle(req, res, url, json)) return
     if (url.pathname === '/timings' && req.method === 'GET') return json(200, await timingStore.snapshot())
     if (url.pathname === '/timings' && req.method === 'POST') {
       const payload = await body(req)
@@ -86,8 +91,8 @@ const server = http.createServer(async (req, res) => {
       const accepted = payload.events.filter(e => e?.phase === 'end' && timingStore.add(e, 'browser')).length
       return json(200, { accepted })
     }
-    if (req.method === 'GET' && url.pathname === '/health') return json(200, { ok: true, brain: 'opencode', projects: true, applications: ['opencode', 'codex'], tts: false, stt: false, screenOptIn: true, recordingControlVersion: 1, autoScreen: process.env.JARVIS_AUTO_SCREEN !== '0' })
-    if (req.method === 'GET' && url.pathname === '/projects') return json(200, { projects: await projects.list(), defaultServerURL: projects.serverURL })
+    if (req.method === 'GET' && url.pathname === '/health') return json(200, { ok: true, brain: 'opencode', projects: true, applications: ['opencode', 'codex', 'claude', 'antigravity'], tts: false, stt: false, screenOptIn: true, recordingControlVersion: 1, autoScreen: process.env.JARVIS_AUTO_SCREEN !== '0' })
+    if (req.method === 'GET' && url.pathname === '/projects') return json(200, { projects: await projects.list(), defaultServerURL: projects.serverURL, applications: await native.availability() })
     if (req.method === 'POST' && url.pathname === '/projects') return json(200, { project: await projects.open(await body(req)) })
     if (req.method === 'POST' && url.pathname === '/projects/browse') {
       await body(req)
@@ -101,7 +106,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/profile') return json(200, await publicProfile(project))
     if (req.method === 'GET' && url.pathname === '/models') {
       if (!project) return json(200, { models: [nativeDefault], defaultModel: nativeDefault.id })
-      if (project.application === 'codex') return json(200, { models: [{ ...nativeDefault, provider: 'Codex', audioReason: 'Codex usa solo dictado del navegador en este cliente; el audio directo está deshabilitado.' }, ...await codex.models(project.directory)], defaultModel: nativeDefault.id })
+      if (['claude','antigravity'].includes(project.application)) return json(200, { models: [{ ...nativeDefault, provider: project.application === 'claude' ? 'Claude Code' : 'Antigravity', image: project.application === 'claude', audioReason: 'Este cliente recibe texto transcrito (navegador o Whisper local), sin audio original.' }, ...await native.models(project.directory, project.application)], defaultModel: nativeDefault.id })
+      if (project.application === 'codex') return json(200, { models: [{ ...nativeDefault, provider: 'Codex', audioReason: 'Codex recibe solo texto transcrito (navegador o Whisper local); el audio directo está deshabilitado.' }, ...await codex.models(project.directory)], defaultModel: nativeDefault.id })
       return json(200, { models: [nativeDefault, ...availableModels(await projects.api(project)('GET', '/provider'))], defaultModel: nativeDefault.id })
     }
     return json(404, { error: 'Ruta no disponible.' })
@@ -120,8 +126,8 @@ wss.on('connection', async (socket, req) => {
     socket.close(); return
   }
   if (socket.readyState !== socket.OPEN) return
-  if (initialProject?.application === 'codex') {
-    try { await attachCodexClient(socket, { project: initialProject, manager: codex, recorder, timingStore, queued, buffer, query: initialQuery }) }
+  if (initialProject && initialProject.application !== 'opencode') {
+    try { await attachCodexClient(socket, { project: initialProject, manager: initialProject.application === 'codex' ? codex : { runtime: directory => native.runtime(directory, initialProject.application) }, recorder, timingStore, queued, buffer, query: initialQuery }) }
     catch (error) {
       if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ type: 'session_error', message: publicError(error) }))
       socket.close()
@@ -447,7 +453,7 @@ for (const signal of ['SIGINT','SIGTERM']) process.on(signal, () => {
   shuttingDown = true
   for (const socket of wss.clients) socket.close()
   clearInterval(recorder.maintenance)
-  void Promise.allSettled([recorder.setActive(false), codex.close()]).finally(() => server.close(() => process.exit(0)))
+  void Promise.allSettled([whisper.close(), recorder.setActive(false), codex.close(), native.close()]).finally(() => server.close(() => process.exit(0)))
   setTimeout(() => process.exit(0), 2000).unref()
 })
 server.listen(PORT, process.env.JARVIS_BRIDGE_HOST || '127.0.0.1')

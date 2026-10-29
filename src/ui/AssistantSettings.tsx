@@ -1,9 +1,10 @@
+import type { Application } from '../lib/projects'
 import type { PermissionMode } from '../lib/bridge'
 import { useEffect, useRef, useState } from 'react'
 import { VoiceInputControl } from './VoiceInputControl'
 
 const names: Record<PermissionMode, string> = { manual: 'Manual', limited: 'Automático limitado', total: 'Automático total' }
-type Props = { application?: 'opencode' | 'codex'; mode: PermissionMode; connected: boolean; pending: boolean; error: string; autoApproved: number; rate: number;
+type Props = { application?: Application; mode: PermissionMode; connected: boolean; pending: boolean; error: string; autoApproved: number; rate: number;
   onMode: (mode: PermissionMode) => void; onRate: (rate: number) => void; onResetRate: () => void }
 
 export function AssistantSettings({ mode, connected, pending, error, autoApproved, rate, onMode, onRate, onResetRate, application = 'opencode' }: Props) {
@@ -23,7 +24,7 @@ export function AssistantSettings({ mode, connected, pending, error, autoApprove
       <p>Se aplica a las próximas frases. Se guarda en este navegador; no cambia tu configuración del asistente.</p>
       <button type="button" className="surface-button" onClick={onResetRate}>Usar velocidad del perfil</button>
       <label htmlFor="assistant-permission-mode">Modo de permisos</label>
-      <select id="assistant-permission-mode" ref={select} value={mode} disabled={!connected || pending} onChange={e => {
+      <select id="assistant-permission-mode" ref={select} value={mode} disabled={!connected || pending || application === 'antigravity'} onChange={e => {
         const next = e.target.value as PermissionMode
         if (next === 'total' && mode !== 'total') setConfirmingTotal(true)
         else { setConfirmingTotal(false); onMode(next) }
@@ -32,6 +33,7 @@ export function AssistantSettings({ mode, connected, pending, error, autoApprove
         <option value="limited">Automático limitado · leer configuración</option>
         <option value="total">Automático total · riesgo elevado</option>
       </select>
+      {application === 'antigravity' && <p>Antigravity CLI aplica sus reglas nativas. Las operaciones que requieren preguntar se rechazan en modo no interactivo; gestiónalas desde agy. Este panel no amplía sus permisos.</p>}
       {confirmingTotal && <section className="assistant-settings__warning" role="group" aria-labelledby="total-mode-warning">
         <h3 id="total-mode-warning">¿Activar automático total?</h3>
         <p>Podrá ejecutar comandos, modificar o borrar archivos y acceder fuera de su carpeta sin preguntarte. Solo para esta conexión; se respetan los bloqueos explícitos de la aplicación.</p>

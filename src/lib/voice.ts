@@ -403,7 +403,10 @@ if (typeof window !== 'undefined') {
  * The microphone is opened once here so a denied permission is reported loudly
  * rather than surfacing later as an unexplained deafness, whichever engine runs.
  */
-export async function startVoice(h: VoiceHandlers, options: { browserOnly?: boolean } = {}): Promise<Voice> {
+export async function startVoice(h: VoiceHandlers, options: {
+  browserOnly?: boolean
+  localTranscribe?: (blob: Blob, signal: AbortSignal) => Promise<string>
+} = {}): Promise<Voice> {
   try {
     await getMic()
   } catch (err) {
@@ -415,13 +418,17 @@ export async function startVoice(h: VoiceHandlers, options: { browserOnly?: bool
     )
     return { stop: () => {}, live: () => false }
   }
+  if (options.localTranscribe) {
+    diag.engine = 'whisper'
+    return startElevenVoice(h, options.localTranscribe)
+  }
   const premium = !options.browserOnly && caps().stt
   diag.engine = premium ? 'elevenlabs' : 'browser'
   return premium ? startElevenVoice(h) : startBrowserVoice(h)
 }
 
-/** VAD + ElevenLabs Scribe. */
-async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
+/** Shared VAD/ordered assembly; an explicit local engine never falls back. */
+async function startElevenVoice(h: VoiceHandlers, localTranscribe?: (blob: Blob, signal: AbortSignal) => Promise<string>): Promise<Voice> {
   const WAKE = {
     test: (text: string) => wakePattern(currentProfile(), h.requireGreeting?.() ? 'greeting' : 'any').test(text),
     exec: (text: string) => wakePattern(currentProfile(), h.requireGreeting?.() ? 'greeting' : 'any').exec(text),
@@ -447,6 +454,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
    */
   const pendingAudio: Blob[] = []
   let draining = false
+  let transcription: AbortController | undefined
 
   /**
    * Transcripts become turns here rather than one-per-segment.
@@ -477,23 +485,26 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
     const recognized = timing.recognizing()
     const t0 = performance.now()
     try {
-      const res = await fetch(`${BRIDGE_HTTP_URL}/stt`, {
-        method: 'POST',
-        headers: { 'content-type': blob.type || 'audio/webm' },
-        body: blob,
-      })
+      let text: string | undefined
+      if (localTranscribe) {
+        const controller = new AbortController()
+        transcription = controller
+        text = await localTranscribe(blob, controller.signal)
+      } else {
+        const res = await fetch(BRIDGE_HTTP_URL + '/stt', {
+          method: 'POST', headers: { 'content-type': blob.type || 'audio/webm' }, body: blob,
+        })
+        if (mine !== generation) return
+        if (!res.ok) {
+          diag.restarts++; recognized('error'); timing.cancel('error')
+          diag.lastError = 'stt ' + res.status
+          drop('transcription failed (' + res.status + ')')
+          return
+        }
+        ;({ text } = await res.json() as { text?: string })
+      }
       if (mine !== generation) return
       diag.idleMs = Math.round(performance.now() - t0)
-      if (!res.ok) {
-        diag.restarts++
-        recognized('error')
-        timing.cancel('error')
-        diag.lastError = `stt ${res.status}`
-        drop(`transcription failed (${res.status})`)
-        return
-      }
-      const { text } = (await res.json()) as { text?: string }
-      if (mine !== generation) return
       recognized()
       const said = (text ?? '').trim()
       diag.lastError = ''
@@ -533,7 +544,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       // Not a turn yet — a piece of one. The assembler decides when the thought
       // is finished, reading the words and whether the room is still noisy.
       timing.assembling()
-      assemble.feed(said, vad?.meter().speaking ?? false)
+      assemble.feed(said, (vad?.meter().speaking ?? false) || pendingAudio.length > 0)
     } catch (err) {
       if (mine !== generation) return
       recognized('error')
@@ -541,6 +552,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       diag.restarts++
       diag.lastError = String(err)
       drop('could not reach the speech service')
+      if (localTranscribe) h.onError('Whisper local: ' + (err instanceof Error ? err.message : String(err)))
     }
   }
 
@@ -548,16 +560,18 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
   const drain = async () => {
     if (draining) return
     draining = true
+    const owner = generation
     try {
-      while (pendingAudio.length) {
+      while (pendingAudio.length && (!localTranscribe || owner === generation)) {
         await transcribe(pendingAudio.shift()!)
       }
     } finally {
-      draining = false
-      // A resumed noise/empty/failed segment must not strand a valid first
-      // clause after onStart suspended its timer. Settle only once truly quiet.
-      if (!pendingAudio.length && !vad?.meter().speaking && ['command', 'guard'].includes(h.mode()) && assemble.held()) {
-        assemble.feed('', false)
+      if (!localTranscribe || owner === generation) {
+        draining = false
+        // A failed continuation must not strand a valid earlier clause.
+        if (!pendingAudio.length && !vad?.meter().speaking && ['command', 'guard'].includes(h.mode()) && assemble.held()) {
+          assemble.feed('', false)
+        }
       }
     }
   }
@@ -636,9 +650,15 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
   }, 200)
 
   return {
+    commit: () => {
+      if (!localTranscribe || draining || !assemble.held() || !['command', 'guard'].includes(h.mode())) return false
+      assemble.flush()
+      return true
+    },
     reset: () => {
       timing.cancel()
       generation++
+      if (localTranscribe) { transcription?.abort(); draining = false; vad?.reset?.() }
       pendingAudio.length = 0
       assemble.cancel()
       diag.holding = ''
@@ -646,6 +666,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
     stop: () => {
       timing.cancel()
       generation++
+      transcription?.abort()
       pendingAudio.length = 0
       clearInterval(guardPoll)
       assemble.cancel()

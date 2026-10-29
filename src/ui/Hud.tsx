@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { useStore, accentFor, type Phase } from '../store'
+import { useStore, accentFor } from '../store'
 import { ResponseText } from './ResponseText'
 import { ListeningControl } from './ListeningControl'
 import { MicrophoneControl } from './MicrophoneControl'
@@ -12,18 +12,12 @@ import { Pointer } from './Pointer'
 import { GestureGuide } from './GestureGuide'
 import { HistoryControl, ScreenControl } from './CaptureControls'
 import { useProfile, displayName, wakeWord } from '../lib/profile'
-import { useVoiceInputMode } from '../lib/voice-input-mode'
+import { useVoiceInputMode, useVoiceInputStatus } from '../lib/voice-input-mode'
+import { useProjects } from '../lib/projects'
 
-const statusText: Record<Phase, string> = {
-  offline: 'OFFLINE',
-  boot: 'INITIALISING',
-  dormant: 'EN ESPERA',
-  waking: 'ONLINE',
-  listening: 'LISTENING',
-  thinking: 'PROCESSING',
-  tooling: 'ACCESSING SYSTEMS',
-  speaking: 'RESPONDING',
-}
+// Input availability and answer activity are independent: muting must never
+// imply that an answer stopped, or that dormant capture accepts questions.
+const answerStatus = { thinking: 'PROCESSING', tooling: 'ACCESSING SYSTEMS', speaking: 'RESPONDING' }
 
 function Corner({ at }: { at: 'tl' | 'tr' | 'bl' | 'br' }) {
   return <div className={`corner corner-${at}`} />
@@ -46,6 +40,8 @@ type HudProps = {
 export function Hud({ onPause, onResume, onToggleMicrophone, onToggleStandby, onSubmitTranscript, onSendMessage, onReplay, chatId, composerScope }: HudProps) {
   const profile = useProfile()
   const inputMode = useVoiceInputMode()
+  const voiceInputStatus = useVoiceInputStatus()
+  const { selected: project } = useProjects()
   const log = useRef<HTMLDivElement>(null)
   const content = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
@@ -69,19 +65,23 @@ export function Hud({ onPause, onResume, onToggleMicrophone, onToggleStandby, on
   const looking = useStore((s) => s.looking)
   const screenCapture = useStore((s) => s.screenCapture)
   const recording = useStore((s) => s.recording)
+  const applicationCapabilities = useStore((s) => s.applicationCapabilities)
   const autoScreen = useStore((s) => s.autoScreen)
   const ui = useStore((s) => s.ui)
-  const transcriptPending = inputMode === 'transcript' && phase === 'listening' && microphoneActive && !microphoneMuted && !microphoneStandby && !conversationPaused && !!caption.trim() && !!onSubmitTranscript
+  const transcriptPending = (inputMode === 'transcript' || inputMode === 'whisper') && phase === 'listening' && microphoneActive && !microphoneMuted && !microphoneStandby && !conversationPaused && !!caption.trim() && !!onSubmitTranscript
 
   // accentFor folds JARVIS's overrides in over the phase colour, so one
   // variable on the root carries a theme change into every .hud-* rule without
   // a single component knowing a theme exists.
   const colour = accentFor(phase, ui)
   const answerBusy = ['thinking', 'tooling', 'speaking'].includes(phase)
-  const phaseStatus = phase === 'boot' && bootNote ? bootNote
-    : !microphoneActive && !answerBusy && phase !== 'boot' ? 'SOLO TEXTO' : statusText[phase]
-  const inputStatus = microphoneMuted ? 'MICRÓFONO APAGADO'
-    : microphoneActive && (microphoneStandby || conversationPaused) && phase !== 'boot' ? 'SOLO ACTIVACIÓN' : ''
+  const microphoneAvailability = microphoneMuted || !microphoneActive || phase === 'offline' || phase === 'boot' ? 'off'
+    : microphoneStandby || conversationPaused || phase === 'dormant' && profile.configured ? 'wake' : 'active'
+  const inputStatus = microphoneAvailability === 'off' ? 'MICRÓFONO APAGADO'
+    : microphoneAvailability === 'wake' ? 'SOLO ACTIVACIÓN' : 'ESCUCHA ACTIVA'
+  const phaseStatus = phase === 'boot' ? bootNote || 'INITIALISING'
+    : answerBusy ? answerStatus[phase as keyof typeof answerStatus]
+      : microphoneAvailability === 'off' ? 'SOLO TEXTO' : ''
 
   useEffect(() => {
     // The ground has to be set on the document, not painted here: the HUD sits
@@ -151,14 +151,14 @@ export function Hud({ onPause, onResume, onToggleMicrophone, onToggleStandby, on
               </div>
             )}
 
-            <div className="status">
+            <div className="status" role="status" aria-live="polite" data-input={microphoneAvailability}>
               <span className="dot" />
               <span className="status-text">
                 {/* bootNote is the voice-model download readout. It is only ever
                     the right thing to show during boot — as a general fallback a
                     note that never got cleared (a stuck 'voice 97%') sits over
                     LISTENING and PROCESSING for the rest of the session. */}
-                {inputStatus ? `${inputStatus} · ${phaseStatus}` : phaseStatus}
+                {phaseStatus ? `${inputStatus} · ${phaseStatus}` : inputStatus}
               </span>
             </div>
           </header>
@@ -237,17 +237,29 @@ export function Hud({ onPause, onResume, onToggleMicrophone, onToggleStandby, on
                 Enviar texto <kbd>Enter</kbd>
               </button>
             </div>}
-            <MicrophoneControl muted={microphoneMuted} busy={microphoneBusy || phase === 'boot'}
-              inactive={!microphoneActive || phase === 'boot'}
-              standby={microphoneStandby} name={wakeWord(profile)} onStandby={onToggleStandby}
-              historyActive={recording?.active !== false} historyMicrophone={recording?.audio?.includes('mic') !== false} onToggle={onToggleMicrophone} />
-            <ListeningControl paused={conversationPaused} muted={microphoneMuted || !microphoneActive} standby={microphoneStandby}
-              disabled={phase === 'offline' || phase === 'boot' || microphoneMuted && conversationPaused}
-              name={wakeWord(profile)} onPause={onPause} onResume={onResume} />
-            {recording && <HistoryControl recording={recording} muted={microphoneMuted} />}
-            <ScreenControl enabled={autoScreen} available={recording?.controlVersion === 1} onChange={(enabled) => useStore.getState().setAutoScreen(enabled)} />
-            {screenCapture !== 'off' && <span className="capture-status" role="status">{screenCapture === 'capturing'
-              ? 'Capturando monitor…' : screenCapture === 'attached' ? 'Captura adjunta' : 'Sin captura del monitor'}</span>}
+            <section className="control-section control-section--voice" aria-labelledby="voice-controls-title">
+              <h2 className="control-section__title" id="voice-controls-title">Voz</h2>
+              <MicrophoneControl availability={microphoneAvailability} muted={microphoneMuted} busy={microphoneBusy || phase === 'boot'}
+                inactive={microphoneAvailability === 'off'}
+                standby={microphoneStandby} name={wakeWord(profile)} onStandby={onToggleStandby}
+                historyActive={recording?.active === true} historyMicrophone={recording?.audio?.includes('mic') !== false} onToggle={onToggleMicrophone} />
+              {inputMode === 'whisper' && voiceInputStatus && <p className="control-help" role="status" aria-live="polite">{voiceInputStatus}</p>}
+              <ListeningControl paused={conversationPaused} muted={microphoneMuted || !microphoneActive} standby={microphoneStandby}
+                disabled={phase === 'offline' || phase === 'boot' || microphoneMuted && conversationPaused}
+                name={wakeWord(profile)} onPause={onPause} onResume={onResume} />
+            </section>
+            {recording ? <HistoryControl recording={recording} muted={microphoneMuted} />
+              : <section className="control-section control-section--history" aria-labelledby="history-controls-title">
+                <h2 className="control-section__title" id="history-controls-title">Historial</h2>
+                <p className="control-state" role="status">Sin confirmar</p>
+                <span className="control-help">Conecta el puente para comprobar el historial.</span>
+              </section>}
+            <ScreenControl enabled={autoScreen} captureStatus={screenCapture}
+              available={recording?.controlVersion === 1 && applicationCapabilities?.screenOptIn === true}
+              unavailableReason={project?.application === 'antigravity' ? 'Antigravity CLI solo admite texto; no puede recibir capturas.'
+                : applicationCapabilities?.screenOptIn === false ? 'Esta aplicación no admite capturas de pantalla.'
+                  : 'Conecta el puente actualizado y espera la confirmación de compatibilidad con pantalla.'}
+              onChange={(enabled) => useStore.getState().setAutoScreen(enabled)} />
           </footer>
         </div>
       </section>

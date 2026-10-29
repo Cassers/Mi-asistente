@@ -5,12 +5,12 @@ import { openProject, refreshProjects, selectProject, useProjects, type Applicat
 import { timedFetch } from '../lib/timings'
 
 export function ProjectPicker({ disabled = false }: { disabled?: boolean }) {
-  const { projects, selected, loading, error, available, defaultServerURL } = useProjects()
+  const { projects, selected, loading, error, available, defaultServerURL, applications }  = useProjects()
   const id = useId()
   const [applicationChoice, setApplicationChoice] = useState<{ project?: string; application: Application }>({ project: selected?.id, application: selected?.application || 'opencode' })
   const application = applicationChoice.project === selected?.id ? applicationChoice.application : selected?.application || 'opencode'
   const setApplication = (next: Application) => setApplicationChoice({ project: selected?.id, application: next })
-  const applicationName = application === 'codex' ? 'Codex' : 'OpenCode'
+  const applicationName = ({ opencode: 'OpenCode', codex: 'Codex', claude: 'Claude Code', antigravity: 'Antigravity' } as const)[application]
   const [directory, setDirectory] = useState('')
   const [serverURL, setServerURL] = useState<string | null>(null)
   const [password, setPassword] = useState('')
@@ -65,7 +65,11 @@ export function ProjectPicker({ disabled = false }: { disabled?: boolean }) {
           if (!directory && selected) setDirectory(selected.directory)
         }}>
           <option value="opencode">OpenCode</option><option value="codex">Codex</option>
+          {(['claude','antigravity'] as Application[]).map(id => { const info = applications?.find(app => app.id === id); return <option key={id} value={id} disabled={!info?.available}>{id === 'claude' ? 'Claude Code' : 'Antigravity'}{info?.available ? '' : ' · No disponible'}</option> })}
         </select>
+        {applications?.filter(app => !app.available).map(app => <p key={app.id} role="status">{app.name}: {app.reason}</p>)}
+        {application === 'antigravity' && <p>Conexión con agy instalado: solo texto. Historial de conversaciones creadas en Mi-asistente; los permisos se resuelven en sus reglas nativas.</p>}
+        {application === 'claude' && <p>Usa Claude Code instalado, su cuenta y la configuración de esta carpeta. No reemplaza las instrucciones del proyecto.</p>}
         {application === 'codex' && <p>Usa Codex instalado en este equipo y su sesión iniciada. No necesitas pegar una clave aquí.</p>}
         <label htmlFor={`${id}-recent`}>Proyectos recientes</label>
         <select id={`${id}-recent`} value={selected?.id || ''} onChange={event => {
@@ -78,7 +82,7 @@ export function ProjectPicker({ disabled = false }: { disabled?: boolean }) {
           setStatus('')
         }}>
           <option value="" disabled>Elige un proyecto</option>
-          {projects.map(p => <option key={p.id} value={p.id}>{p.application === 'codex' ? 'Codex' : 'OpenCode'} · {p.name} · {p.directory}</option>)}
+          {projects.map(p => <option key={p.id} value={p.id}>{({ opencode: 'OpenCode', codex: 'Codex', claude: 'Claude Code', antigravity: 'Antigravity' } as const)[p.application]} · {p.name} · {p.directory}</option>)}
         </select>
         <label htmlFor={`${id}-path`}>Ruta del proyecto</label>
         <input id={`${id}-path`} type="text" value={directory} onChange={event => setDirectory(event.target.value)} required autoComplete="off" placeholder="/ruta/a/tu/proyecto" />

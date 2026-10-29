@@ -19,7 +19,7 @@ async function fixture({ select, connected = true, application = 'opencode' } = 
     removeEventListener(type, fn) { this.listeners.get(type)?.delete(fn) }
     send(raw) { this.sent.push(JSON.parse(raw)) }
     emit(message) { for (const fn of [...(this.listeners.get('message') || [])]) fn({ data: JSON.stringify(message) }) }
-    open(chat = 'c1') { this.readyState = 1; this.onopen(); this.emit({ type: 'ready', servers: [project.application], conversation: { id: chat, turns: [], entries: [], title: 'fixture' } }); this.emit({ type: 'recording', recording: { active: false, controlVersion: 1 } }) }
+    open(chat = 'c1') { this.readyState = 1; this.onopen(); this.emit({ type: 'ready', servers: [project.application], capabilities: { screenOptIn: project.application !== 'antigravity', archive: project.application === 'codex' }, conversation: { id: chat, turns: [], entries: [], title: 'fixture' } }); this.emit({ type: 'recording', recording: { active: false, controlVersion: 1 } }) }
     close() { this.readyState = 3; this.onclose?.(); for (const fn of [...(this.listeners.get('close') || [])]) fn({}) }
   }
   const timings = timingStub()
@@ -29,7 +29,7 @@ async function fixture({ select, connected = true, application = 'opencode' } = 
     '../store': { useStore: { setState: patch => Object.assign(state, patch), getState: () => state } },
     './projects': { selectedProject: () => project, subscribeProjects: fn => { watchers.add(fn); return () => watchers.delete(fn) } },
     './models': { currentModelSelection: () => select ? select() : Promise.resolve(model === 'native/default' ? {} : { model, variant: 'high' }) },
-    './voice-input-mode': { currentVoiceInputMode: () => project.application === 'codex' ? 'transcript' : mode, reportVoiceInput: value => statuses.push(value) },
+    './voice-input-mode': { currentVoiceInputMode: () => project.application !== 'opencode' ? 'transcript' : mode, reportVoiceInput: value => statuses.push(value) },
     './utterance-audio': { captureDiagnostics: () => ({ status: 'ready', durationMs: 6000 }) },
     './timings': { ...timings, startTiming(name, traceId) { const span = timings.startTiming(name, traceId); if (name !== 'audio.queue') return span
       const row = { traceId }; queueSpans.push(row); return { ...span, end(status = 'ok') { row.status ??= status } } } },
@@ -167,11 +167,19 @@ test('three clips also preserve a held second selection after the first native s
 
 test('Codex client rejects old direct clips and explicit audio overrides without sending their captions', async () => {
   const f = await fixture({ application: 'codex' })
-  await assert.rejects(f.ask('old-audio-caption'), /solo dictado/)
-  await assert.rejects(f.app.ask('old-audio-caption', { onText() {}, onTool() {} }, undefined, 'trace', { audioMode: 'direct' }), /solo dictado/)
-  assert.equal(f.frames().length, 0)
+  const rejectsOriginalAudio = error => {
+    assert.match(error.message, /solo texto transcrito/)
+    assert.match(error.message, /No se envió el clip/)
+    assert.match(error.message, /ni se convirtió su subtítulo en un mensaje/)
+    assert.equal(f.frames().length, 0, 'rejected direct input cannot dispatch its clip or subtitle')
+    return true
+  }
+  await assert.rejects(f.ask('old-audio-caption'), rejectsOriginalAudio)
+  await assert.rejects(f.app.ask('old-audio-caption', { onText() {}, onTool() {} }, undefined, 'trace', { audioMode: 'direct' }), rejectsOriginalAudio)
   const text = f.app.ask('Fresh browser dictation', { onText() {}, onTool() {} }); await flush()
   assert.equal(f.frames()[0].audioMode, 'transcript'); assert.equal(f.frames()[0].audio, undefined)
+  assert.equal(f.frames().length, 1, 'only fresh intentional text reaches Codex')
+  assert.doesNotMatch(JSON.stringify(f.frames()), /old-audio-caption/)
   assert.equal(f.frames()[0].text, 'Fresh browser dictation'); f.done(f.frames()[0]); await text
 })
 
@@ -201,4 +209,30 @@ test('screen sharing consent is revoked on every project and chat destination ch
   assert.equal(f.state.autoScreen, false)
   const three = f.app.ask('C', { onText() {}, onTool() {} }); await flush()
   assert.equal(f.frames().at(-1).screen, false); f.done(f.frames().at(-1)); await three
+})
+
+test('switching OC direct to Claude or Antigravity detaches old PCM and submits only fresh dictation',async()=>{
+  for(const application of ['claude','antigravity']){
+    const choice=deferred(),f=await fixture({select:()=>choice.promise})
+    const old=f.ask('private-old-pcm');await flush()
+    f.setProject('new-'+application,application);await flush();f.ws.open('native-chat');await flush()
+    choice.resolve({});await flush();assert.equal((await old).status,'detached');assert.equal(f.frames().length,0)
+    const next=f.app.ask('Fresh dictated question',{onText(){},onTool(){}});await flush()
+    assert.equal(f.frames().length,1);assert.equal(f.frames()[0].audioMode,'transcript');assert.equal(f.frames()[0].audio,undefined)
+    assert.equal(f.frames()[0].text,'Fresh dictated question');f.done(f.frames()[0]);await next
+  }
+})
+
+test('ready capabilities are socket-scoped, unknown never grants screen, and consent survives initial null-chat ready',async()=>{
+  const f=await fixture({connected:false});f.state.autoScreen=true
+  const warming=f.app.warmBridge();f.ws.open();await warming
+  assert.equal(f.state.applicationCapabilities.screenOptIn,true);assert.equal(f.state.autoScreen,true)
+  f.ws.close();assert.equal(f.state.applicationCapabilities,null)
+  const reconnect=f.app.warmBridge();const ws=f.ws;ws.readyState=1;ws.onopen()
+  ws.emit({type:'ready',servers:['opencode'],conversation:{id:'new',turns:[],entries:[]}});await reconnect
+  assert.equal(f.state.applicationCapabilities,null)
+  f.state.autoScreen=true
+  ws.emit({type:'recording',recording:{active:false,controlVersion:1}})
+  await assert.rejects(f.app.ask('Do not silently send text',{onText(){},onTool(){}},undefined,'screen',{audioMode:'transcript'}),/Reinicia el puente/)
+  assert.equal(ws.sent.some(frame=>frame.type==='ask'),false)
 })

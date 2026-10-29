@@ -165,3 +165,21 @@ test('failed Codex verification and unknown applications leave the existing regi
   assert.equal(await readFile(f.file, 'utf8'), saved)
   assert.deepEqual((await f.projects.list()).map(p => p.id), [previous.id])
 })
+
+test('Claude and Antigravity registry IDs are application-scoped and never forward server credentials',async t=>{
+  const verified=[],f=await fixture(t,{native:{verify:async(dir,application)=>verified.push({dir,application})}})
+  const oc=await f.projects.open({directory:f.directory})
+  for(const application of ['claude','antigravity']){
+    const opened=await f.projects.open({directory:f.directory,application,serverURL:'https://ignored.invalid',password:'fixture-private'})
+    assert.notEqual(opened.id,oc.id);assert.equal(opened.serverURL,'');assert.equal(opened.application,application)
+    assert.throws(()=>f.projects.api(opened),/cliente|Claude|Antigravity/)
+  }
+  assert.deepEqual(verified.map(r=>r.application),['claude','antigravity']);assert.ok(verified.every(r=>r.dir===f.directory))
+  const restored=await new Projects({file:f.projects.file}).list();assert.equal(restored.length,3)
+  assert.doesNotMatch(await readFile(f.projects.file,'utf8'),/fixture-private|ignored.invalid/)
+})
+test('unavailable native applications do not write a registry record',async t=>{
+  const f=await fixture(t,{native:{verify:async()=>{throw Error('Native CLI unavailable')}}})
+  await assert.rejects(f.projects.open({directory:f.directory,application:'antigravity'}),/unavailable/)
+  assert.deepEqual(await f.projects.list(),[])
+})

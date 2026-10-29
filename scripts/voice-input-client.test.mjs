@@ -27,10 +27,10 @@ async function setup(captureStatus = 'missing', select = async () => ({ model: '
       : id === './timings' ? timingStub() : id === './voice-input-mode' ? { currentVoiceInputMode: () => mode, reportVoiceInput: text => statuses.push(text) }
       : id === './models' ? { currentModelSelection: select }
       : id === './projects' ? { selectedProject: () => null, subscribeProjects: () => () => {} }
-      : id === '../config' ? { BRIDGE_WS_URL: 'ws://127.0.0.1:8787' } : { useStore: { setState() {}, getState: () => state } },
+      : id === '../config' ? { BRIDGE_WS_URL: 'ws://127.0.0.1:8787' } : { useStore: { setState: patch => Object.assign(state, patch), getState: () => state } },
   })
   const warming = exports.warmBridge(), ws = instances[0]
-  ws.open(); ws.emit({ type: 'ready', servers: ['opencode'] }); await warming
+  ws.open(); ws.emit({ type: 'ready', servers: ['opencode'], capabilities: { screenOptIn: true } }); await warming
   ws.emit({ type: 'recording', recording: { active: false, controlVersion: 1 } })
   return { app: exports, ws, statuses, state, setMode: value => { mode = value } }
 }
@@ -182,4 +182,18 @@ test('requested sharing rejects an old backend before sending a text-only ask', 
   f.ws.emit({ type: 'recording', recording: { active: false } })
   await assert.rejects(f.app.ask('Mira', { onText() {}, onTool() {} }), /Reinicia el puente/)
   assert.equal(f.ws.sent.some(frame => frame.type === 'ask'), false)
+})
+
+test('Whisper is serialized as transcript-only for every native application, never as original audio', async () => {
+  for (const application of ['opencode', 'codex', 'claude', 'antigravity']) {
+    const f = await setup(); f.setMode('whisper')
+    f.ws.emit({ type: 'ready', servers: [application], capabilities: { screenOptIn: true } })
+    const running = f.app.ask('Texto reconocido por Whisper local', { onText() {}, onTool() {} }, { mime: 'audio/wav', data: 'never-send-raw-whisper-clip' })
+    for (let i = 0; i < 24; i++) await Promise.resolve()
+    const sent = f.ws.sent.find(message => message.type === 'ask')
+    assert.ok(sent, application); assert.equal(sent.audioMode, 'transcript')
+    assert.equal(sent.audio, undefined); assert.equal(sent.text, 'Texto reconocido por Whisper local')
+    assert.doesNotMatch(JSON.stringify(f.ws.sent), /never-send-raw-whisper-clip/)
+    f.ws.emit({ type: 'done', ask: sent.id, text: 'Respuesta sintética' }); await running
+  }
 })

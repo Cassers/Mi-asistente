@@ -61,3 +61,28 @@ test('application changes notify capture listeners immediately; Codex cannot mut
   app.setVoiceInputMode('direct'); app.setVoiceInputMode('transcript'); assert.equal(storage.get('assistant.voice.input-mode'), 'direct')
   app.select('opencode'); assert.deepEqual(observed, ['transcript', 'direct'])
 })
+
+test('Claude and Antigravity enforce fresh browser transcription while preserving OpenCode direct preference',()=>{
+  for(const application of ['claude','antigravity']){
+    const storage=new Map([['assistant.voice.input-mode','direct']]),app=load(storage)
+    app.select(application);assert.equal(app.currentVoiceInputMode(),'transcript')
+    app.setVoiceInputMode('direct');assert.equal(app.currentVoiceInputMode(),'transcript');assert.equal(storage.get('assistant.voice.input-mode'),'direct')
+    app.select('opencode');assert.equal(app.currentVoiceInputMode(),'direct')
+  }
+})
+
+test('explicit Whisper choice persists separately per native application and preserves the OpenCode direct preference', () => {
+  const storage = new Map(), app = load(storage)
+  for (const application of ['codex', 'claude', 'antigravity']) {
+    app.select(application); assert.equal(app.currentVoiceInputMode(), 'transcript')
+    app.setVoiceInputMode('whisper'); assert.equal(app.currentVoiceInputMode(), 'whisper')
+    assert.equal(load(storage, application).currentVoiceInputMode(), 'whisper')
+    app.setVoiceInputMode('direct'); assert.equal(app.currentVoiceInputMode(), 'whisper')
+  }
+  app.select('opencode'); assert.equal(app.currentVoiceInputMode(), 'direct')
+  app.setVoiceInputMode('transcript', 'claude')
+  assert.equal(app.currentVoiceInputMode(), 'direct')
+  app.select('claude'); assert.equal(app.currentVoiceInputMode(), 'transcript')
+  app.select('antigravity'); assert.equal(app.currentVoiceInputMode(), 'whisper')
+  assert.equal(storage.has('assistant.voice.input-mode'), false)
+})

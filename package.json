@@ -22,7 +22,8 @@
     "test": "node scripts/setup.mjs && node --test --test-concurrency=2 bridge/*.test.mjs scripts/*.test.mjs",
     "audit:publication": "node scripts/audit-publication.mjs",
     "start:legacy": "node scripts/start.mjs",
-    "bridge:legacy": "node bridge/opencode-bridge.mjs"
+    "bridge:legacy": "node bridge/opencode-bridge.mjs",
+    "whisper:setup": "node scripts/whisper-setup.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.220",

@@ -31,6 +31,7 @@ export function ConversationsPanel({ onStop }: { onStop?: () => void }) {
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const error = localError || bridgeError
   const phase = useStore((s) => s.phase)
+  const applicationCapabilities = useStore(s => s.applicationCapabilities)
   const responseBusy = chat?.busy === true || ['thinking', 'tooling', 'speaking', 'waking'].includes(phase)
   const locked = changing || Boolean(deletingId && deletingId === chat?.id && !error) || phase === 'boot' || (!projects.available && responseBusy)
   if (!usingBridge) return null
@@ -45,7 +46,7 @@ export function ConversationsPanel({ onStop }: { onStop?: () => void }) {
     catch (err) { setError(String(err)) }
     finally { setChanging(false) }
   }
-  const applicationName = projects.selected?.application === 'codex' ? 'Codex' : 'OpenCode'
+  const applicationName = ({ opencode: 'OpenCode', codex: 'Codex', claude: 'Claude Code', antigravity: 'Antigravity' } as const)[projects.selected?.application || 'opencode']
   const choose = async (id: string) => {
     setChanging(true); setError(''); setDeletingId(null)
     try { await chooseConversation(id) }
@@ -74,14 +75,15 @@ export function ConversationsPanel({ onStop }: { onStop?: () => void }) {
           <TimingsPanel />
           {projects.available && <ProjectPicker disabled={changing || phase === 'boot'} />}
           {(chat || error) && (
-            <ConversationCard removeLabel={projects.selected?.application === 'codex' ? 'Archivar' : 'Eliminar'} id={chat?.id || ''} entries={chat?.entries || []} locked={locked} error={error} observeBusy={projects.available} deleteLocked={responseBusy}
+            <ConversationCard removeLabel={projects.selected?.application === 'codex' ? 'Archivar' : 'Eliminar'} id={chat?.id || ''} entries={chat?.entries || []} locked={locked} error={error} observeBusy={projects.available} deleteLocked={responseBusy || applicationCapabilities?.archive === false || ['claude','antigravity'].includes(projects.selected?.application || '')}
               onStop={projects.available && responseBusy ? onStop : undefined}
               status={changing ? 'Abriendo conversación…' : deletingId && !error ? 'Eliminando conversación…'
-                : responseBusy ? `${applicationName} está trabajando · puedes cambiar de conversación sin detenerlo` : chat ? `Historial nativo de ${applicationName}` : 'Sin conexión · puedes crear un chat nuevo'}
+                : responseBusy ? `${applicationName} está trabajando · puedes cambiar de conversación sin detenerlo` : chat ? projects.selected?.application === 'antigravity' ? 'Conversaciones de Antigravity creadas en Mi-asistente' : `Historial nativo de ${applicationName}` : 'Sin conexión · puedes crear un chat nuevo'}
               onChoose={(id) => void choose(id)} onRefresh={refreshConversations} onDelete={() => {
                 if (!window.confirm(projects.selected?.application === 'codex' ? '¿Archivar esta conversación de Codex? Se conservará en el historial nativo archivado.' : '¿Borrar definitivamente esta conversación de OpenCode? Las grabaciones locales y las memorias ME/ no se borran. Esto no retira datos ya enviados al proveedor.')) return
                 try { setDeletingId(chat?.id || null); deleteConversation() } catch (err) { setError(String(err)); setDeletingId(null) }
               }}>
+              {['claude','antigravity'].includes(projects.selected?.application || '') && <p>Gestiona el borrado o archivado desde su cliente nativo.</p>}
               <ModelPicker {...models} application={projects.selected?.application} onApplication={app => { void changeApplication(app) }} locked={locked || responseBusy} onChoose={chooseModel} onRefresh={() => void refreshModels(true)} />
               <AssistantSettings {...policy} application={projects.selected?.application} rate={rate} error={policyError || policy.error} onMode={mode} onRate={setSpeechRate} onResetRate={resetSpeechRate} />
             </ConversationCard>

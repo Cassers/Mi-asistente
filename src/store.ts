@@ -228,6 +228,7 @@ type State = {
   setMicrophoneBusy: (busy: boolean) => void
   conversationPaused: boolean
   setConversationPaused: (paused: boolean) => void
+  applicationCapabilities: { screenOptIn: boolean; archive?: boolean; transcriptOnly?: boolean; nativePermissionUI?: boolean; historyScope?: string } | null
   recording: { active: boolean; fps: number; error?: string; root: string; audio?: string[]; controlVersion?: number } | null
   permissions: PermissionRequest[]
   setPermissions: (permissions: PermissionRequest[]) => void
@@ -311,6 +312,7 @@ export const useStore = create<State>((set) => ({
   setConversationPaused: (conversationPaused) => set({ conversationPaused }),
   permissions: [],
   setPermissions: (permissions) => set({ permissions }),
+  applicationCapabilities: null,
   recording: null,
   setRecording: (recording) => set({ recording }),
   autoScreen: false,

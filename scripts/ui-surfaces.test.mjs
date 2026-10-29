@@ -22,7 +22,10 @@ function component(file, name) {
   } })
   const exports = {}
   vm.runInNewContext(outputText, { exports, require: id => {
+    if (id === '../lib/whisper') return { useWhisperCapabilities: () => ({ state: 'unavailable', capabilities: null, error: 'Whisper no configurado en este fixture.' }),
+      refreshWhisper: async () => { throw Error('fixture unavailable') }, subscribeWhisperInvalidation: () => () => {}, whisperAccept: () => '', transcribeWhisper: () => assert.fail('fixture must never transcribe') }
     if (id === '../lib/brain') return { replyPermission: () => assert.fail('render must never authorize') }
+    if (id === '../lib/projects') return { useProjects: () => ({ applications: [{ id: 'claude', available: true }, { id: 'antigravity', available: true }] }) }
     if (id === '../store') return {}
     if (id === '../lib/native-input') return pureModule('native-input')
     if (id === '../lib/model-search') return pureModule('model-search')
@@ -263,7 +266,7 @@ test('Codex voice selector forces browser transcription and disables direct with
   const html = render(VoiceInput, { application: 'codex' })
   assert.match(html, /<option value="direct" disabled=""/)
   assert.match(html, /value="transcript" selected=""/)
-  assert.match(html, /Codex usa solo el dictado del navegador/)
+  assert.match(html, /Codex recibe solo texto transcrito/)
   assert.match(html, /elección de OpenCode se conserva/)
   const open = render(VoiceInput, { application: 'opencode' })
   assert.match(open, /value="direct" selected=""/)
@@ -277,7 +280,7 @@ test('Codex voice policy stays transcription-only for compatible, unsupported an
   ]) {
     const model = { ...option, name: 'Fixture', provider: 'Codex', image: true, variants: [] }
     const html = render(Picker, { ...props, models: [model], model: model.id })
-    assert.match(html, /Codex usa solo el dictado del navegador/)
+    assert.match(html, /Codex recibe solo texto transcrito/)
     assert.match(html, /Audio directo deshabilitado/)
     assert.doesNotMatch(html, /Audio directo: cada pausa/)
   }
@@ -304,4 +307,22 @@ test('per-turn screen control exposes explicit opt-in, privacy scope and disable
   assert.match(off, /No inicia el historial ni el micrófono/)
   assert.match(off, /Envía una captura del monitor principal con cada pregunta/)
   assert.match(render(Screen, { enabled: true, onChange() {} }), /Compartir pantalla activo · Desactivar/)
+})
+
+test('new native clients expose their real names and transcript-only choice; AGY permissions cannot escalate',()=>{
+  for(const application of ['claude','antigravity']){
+    const name=application==='claude'?'Claude Code':'Antigravity'
+    const voice=render(VoiceInput,{application})
+    assert.match(voice,/value="transcript" selected=""/);assert.match(voice,/<option value="direct" disabled=""/);assert.ok(voice.includes(name+' recibe solo texto transcrito'))
+    const html=render(Picker,{application,models:[],model:'native/default',variant:'',loading:false,locked:false,error:'',onChoose(){},onRefresh(){},onApplication(){}})
+    assert.ok(html.includes(name));assert.match(html,new RegExp('value="'+application+'" selected=""'))
+  }
+  const settings=render(Settings,{application:'antigravity',mode:'manual',connected:true,pending:false,error:'',autoApproved:0,rate:1,onMode(){},onRate(){},onResetRate(){}})
+  assert.match(settings,/id="assistant-permission-mode"[^>]*disabled=""/);assert.match(settings,/reglas nativas/)
+})
+
+test('Claude native questions identify their actual client rather than Codex',()=>{
+  const Input=component('NativeInputPrompt','NativeInputPrompt')
+  const html=render(Input,{request:{id:'claude:fixture:question',permission:'user_input',patterns:[],metadata:{application:'claude',questions:[{id:'0',question:'Choose',options:[]}]}}})
+  assert.match(html,/Claude Code necesita tu respuesta/);assert.doesNotMatch(html,/Codex necesita tu respuesta/)
 })

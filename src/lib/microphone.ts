@@ -2,7 +2,8 @@ import { getMic, setMicBlocked, startAnalyser } from './audio'
 import { startUtteranceAudio, stopUtteranceAudio, resetUtteranceAudio, markUtteranceAudio } from './utterance-audio'
 import { startVoice, type Voice } from './voice'
 import { startDirectVoice, type ClipHandlers } from './direct-voice'
-import { currentVoiceInputMode, subscribeVoiceInputMode } from './voice-input-mode'
+import { currentVoiceInputMode, subscribeVoiceInputMode, reportVoiceInput } from './voice-input-mode'
+import { refreshWhisper, transcribeWhisper } from './whisper'
 import { timingSpan, timingTrace, type TimingSpan } from './voice-timing'
 
 /** Owns all browser voice capture. Late callbacks cannot cross an off/on cycle. */
@@ -20,10 +21,14 @@ export function createMicrophone(handlers: ClipHandlers) {
     input = null
     stopUtteranceAudio()
     setMicBlocked(true)
+    if (currentVoiceInputMode() === 'whisper') reportVoiceInput('Whisper local detenido. No hay transcripción pendiente.')
   }
   const owner = {
     stop,
-    reset: () => { resetUtteranceAudio(); input?.reset?.() },
+    reset: () => {
+      resetUtteranceAudio(); input?.reset?.()
+      if (currentVoiceInputMode() === 'whisper') reportVoiceInput('Whisper local en espera. Se descartó la entrada anterior.')
+    },
     live: () => input?.live() ?? false,
     commit: (): boolean => {
       const mine = generation, active = input
@@ -47,14 +52,22 @@ export function createMicrophone(handlers: ClipHandlers) {
       setMicBlocked(false)
       let failed = false
       try {
+        if (selectedMode === 'whisper') {
+          const available = await refreshWhisper()
+          if (!current()) return replacement ?? false
+          if (!available.available) throw new Error(available.reason || 'Whisper local no está disponible. No se usará otro motor.')
+        }
         // Animation failure must not prevent speech recognition.
         await startAnalyser().catch(() => {})
         if (!current()) return replacement ?? false
         const stream = await getMic()
         if (!current()) return replacement ?? false
-        const capturing = startUtteranceAudio(stream, () => current() ? handlers.mode() : 'deaf')
-        if (selectedMode === 'direct') await capturing
-        else await capturing.catch(() => {})
+        // Whisper's existing VAD owns its clips. No second PCM buffer is needed.
+        if (selectedMode !== 'whisper') {
+          const capturing = startUtteranceAudio(stream, () => current() ? handlers.mode() : 'deaf')
+          if (selectedMode === 'direct') await capturing
+          else await capturing.catch(() => {})
+        }
         if (!current()) return replacement ?? false
         // Old direct callbacks must never become fresh Codex dictation, even
         // when a third-party driver completes after its owner was replaced.
@@ -76,12 +89,27 @@ export function createMicrophone(handlers: ClipHandlers) {
             handlers.onError(message)
           },
         }
-        const started = await (selectedMode === 'direct' ? startDirectVoice(callbacks) : startVoice(callbacks, { browserOnly: selectedMode === 'transcript' }))
+        const started = await (selectedMode === 'direct' ? startDirectVoice(callbacks) : startVoice(callbacks, { browserOnly: selectedMode === 'transcript',
+          ...(selectedMode === 'whisper' ? { localTranscribe: async (blob: Blob, signal: AbortSignal) => {
+            if (!accepting()) throw new DOMException('La entrada de voz cambió.', 'AbortError')
+            reportVoiceInput('Transcribiendo con Whisper local…')
+            try {
+              const text = await transcribeWhisper(blob, { signal })
+              if (!accepting()) throw new DOMException('La entrada de voz cambió.', 'AbortError')
+              reportVoiceInput('Whisper local: texto reconocido, listo para enviar.')
+              return text
+            } catch (error) {
+              if (accepting() && !signal.aborted) reportVoiceInput('Falló Whisper local. No se usará otro motor.')
+              throw error
+            }
+          } } : {}),
+        }))
         if (!current()) { started.stop(); return replacement ?? false }
         input = started
         if (failed) { stop(); return false }
         if (currentVoiceInputMode() !== selectedMode) return owner.start()
         activating.end()
+        if (selectedMode === 'whisper') reportVoiceInput('Whisper local preparado. Solo se enviará el texto reconocido.')
         return true
       } catch (error) {
         activating.end('error')

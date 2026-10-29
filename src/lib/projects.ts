@@ -2,10 +2,11 @@ import { useSyncExternalStore } from 'react'
 import { BRIDGE_HTTP_URL } from '../config'
 import { timedFetch } from './timings'
 
-export type Application = 'opencode' | 'codex'
+export type Application = 'opencode' | 'codex' | 'claude' | 'antigravity'
+export type ApplicationInfo = { id: Application; name: string; available: boolean; reason?: string }
 export type Project = { id: string; name: string; directory: string; application: Application; serverURL: string }
 export type OpenProjectInput = { directory: string; application?: Application; serverURL?: string; username?: string; password?: string }
-type State = { projects: Project[]; selected: Project | null; loading: boolean; error: string; available: boolean; defaultServerURL: string }
+type State = { applications?: ApplicationInfo[]; projects: Project[]; selected: Project | null; loading: boolean; error: string; available: boolean; defaultServerURL: string }
 const KEY = 'assistant.project.selection'
 let state: State = { projects: [], selected: null, loading: false, error: '', available: true, defaultServerURL: '' }
 const listeners = new Set<() => void>()
@@ -34,7 +35,7 @@ function persist(id: string) {
 function project(value: unknown): Project {
   const p = value as Partial<Project> | null
   if (!p || !p.id || !p.name || !p.directory || typeof p.id !== 'string' || typeof p.name !== 'string' ||
-    typeof p.directory !== 'string' || !['opencode', 'codex'].includes(p.application || '') || typeof p.serverURL !== 'string') {
+    typeof p.directory !== 'string' || !['opencode', 'codex', 'claude', 'antigravity'].includes(p.application || '') || typeof p.serverURL !== 'string') {
     throw new Error('La respuesta del proyecto no es válida.')
   }
   // Explicit allowlist: credentials from a response never enter the store.
@@ -72,7 +73,8 @@ export function refreshProjects(): Promise<void> {
         selected = state.selected
         if (!projects.some(p => p.id === selected!.id)) projects.unshift(selected)
       }
-      publish({ projects, selected, defaultServerURL: data.defaultServerURL, available: true, loading: false, error: '' })
+      const applications = Array.isArray(data.applications) ? data.applications.filter((app: ApplicationInfo) => ['claude','antigravity'].includes(app?.id) && typeof app.available === 'boolean') : []
+      publish({ projects, selected, applications, defaultServerURL: data.defaultServerURL, available: true, loading: false, error: '' })
     } catch (error) {
       if (request === generation) publish({ loading: false, error: error instanceof Error ? error.message : 'No se pudieron cargar los proyectos.' })
     }
@@ -94,7 +96,7 @@ export function selectProject(id: string) {
 export async function switchApplication(application: Application): Promise<Project> {
   const selected = state.selected
   if (!selected) throw new Error('Abre una carpeta antes de elegir la aplicación.')
-  if (!['opencode', 'codex'].includes(application)) throw new Error('Aplicación no compatible.')
+  if (!['opencode', 'codex', 'claude', 'antigravity'].includes(application)) throw new Error('Aplicación no compatible.')
   if (selected.application === application) return selected
   const existing = state.projects.find(project => project.application === application && project.directory === selected.directory)
   if (existing) { selectProject(existing.id); return existing }
@@ -114,12 +116,12 @@ export function openProject(input: OpenProjectInput): Promise<Project> {
       if (!directory) throw new Error('Escribe la ruta del proyecto.')
       const body: OpenProjectInput = { directory }
       if (input.application !== undefined) {
-        if (!['opencode', 'codex'].includes(input.application)) throw new Error('Aplicación no compatible.')
+        if (!['opencode', 'codex', 'claude', 'antigravity'].includes(input.application)) throw new Error('Aplicación no compatible.')
         body.application = input.application
       }
-      if (input.application !== 'codex' && input.serverURL?.trim()) body.serverURL = input.serverURL.trim()
-      if (input.application !== 'codex' && input.username?.trim()) body.username = input.username.trim()
-      if (input.application !== 'codex' && input.password) body.password = input.password
+      if ((!input.application || input.application === 'opencode') && input.serverURL?.trim()) body.serverURL = input.serverURL.trim()
+      if ((!input.application || input.application === 'opencode') && input.username?.trim()) body.username = input.username.trim()
+      if ((!input.application || input.application === 'opencode') && input.password) body.password = input.password
       const res = await timedFetch('project.open', `${BRIDGE_HTTP_URL}/projects`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(30000) })
       const opened = project((await responseData(res))?.project)
       const projects = [opened, ...state.projects.filter(p => p.id !== opened.id)]
@@ -131,7 +133,7 @@ export function openProject(input: OpenProjectInput): Promise<Project> {
       return opened
     } catch (error) {
       let message = error instanceof Error ? error.message : 'No se pudo abrir el proyecto.'
-      if (input.application !== 'codex' && input.password) message = message.split(input.password).join('[oculta]')
+      if ((!input.application || input.application === 'opencode') && input.password) message = message.split(input.password).join('[oculta]')
       publish({ loading: false, error: message })
       throw new Error(message)
     }

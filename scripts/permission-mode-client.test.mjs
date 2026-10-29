@@ -30,7 +30,7 @@ async function setup() {
     require: id => id === './utterance-audio' ? { captureDiagnostics: () => ({ status: 'missing', durationMs: 0 }) }
       : id === './timings' ? timingStub() : id === './projects' ? { selectedProject: () => null, subscribeProjects: () => () => {} }
       : id === './models' ? {} : id === '../config' ? { BRIDGE_WS_URL: 'ws://127.0.0.1:8787' }
-      : { useStore: { setState() {}, getState: () => state } },
+      : { useStore: { setState: patch => Object.assign(state, patch), getState: () => state } },
   })
   const warming = exports.warmBridge()
   const ws = instances[0]; ws.open(); ws.emit({ type: 'ready', servers: ['opencode'] })

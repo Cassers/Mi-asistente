@@ -39,8 +39,9 @@ export function nativeClient(serverURL, directory, { username = 'opencode', pass
 
 export class Projects {
   constructor({ serverURL = 'http://127.0.0.1:4097', password = '', username = 'opencode',
-    codex, file = join(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'mi-asistente/projects.json'), client = nativeClient } = {}) {
+    codex, native, file = join(process.env.XDG_STATE_HOME || join(homedir(), '.local/state'), 'mi-asistente/projects.json'), client = nativeClient } = {}) {
     this.codex = codex
+    this.native = native
     this.serverURL = localServer(serverURL)
     this.credentials = { username, password }
     this.file = file
@@ -58,15 +59,15 @@ export class Projects {
     for (const item of data?.projects || []) {
       if (typeof item.directory !== 'string' || !isAbsolute(item.directory)) throw new Error('Proyecto guardado inválido.')
       const application = item.application || 'opencode'
-      if (!['opencode', 'codex'].includes(application)) throw new Error('Aplicación guardada inválida.')
-      const serverURL = application === 'codex' ? '' : localServer(item.serverURL)
+      if (!['opencode', 'codex', 'claude', 'antigravity'].includes(application)) throw new Error('Aplicación guardada inválida.')
+      const serverURL = application !== 'opencode' ? '' : localServer(item.serverURL)
       const id = this.id(serverURL, item.directory, application)
       if (item.id !== id) throw new Error('Proyecto guardado inválido.')
       this.items.set(id, { id, directory: item.directory, name: basename(item.directory) || item.directory, serverURL, application })
     }
     this.loaded = true
   }
-  id(server, directory, application = 'opencode') { return createHash('sha256').update((application === 'codex' ? 'codex' : server) + '\0' + directory).digest('hex').slice(0, 24) }
+  id(server, directory, application = 'opencode') { return createHash('sha256').update((application !== 'opencode' ? application : server) + '\0' + directory).digest('hex').slice(0, 24) }
   async list() { await this.load(); return [...this.items.values()] }
   async get(id) {
     await this.load()
@@ -75,21 +76,24 @@ export class Projects {
     return item
   }
   api(item) {
-    if (item.application === 'codex') throw new Error('Este proyecto usa Codex, no el servidor de OpenCode.')
+    if (item.application !== 'opencode') throw new Error('Este proyecto usa ' + ({ codex: 'Codex', claude: 'Claude Code', antigravity: 'Antigravity' }[item.application] || 'un cliente nativo') + ', no el servidor de OpenCode.')
     if (this.clients.has(item.id)) return this.clients.get(item.id)
     return this.client(item.serverURL, item.directory, item.serverURL === this.serverURL ? this.credentials : {})
   }
   async open({ directory, application = 'opencode', serverURL = this.serverURL, username = 'opencode', password } = {}) {
-    if (!['opencode', 'codex'].includes(application)) throw new Error('Aplicación no compatible.')
+    if (!['opencode', 'codex', 'claude', 'antigravity'].includes(application)) throw new Error('Aplicación no compatible.')
     if (typeof directory !== 'string' || !isAbsolute(directory) || directory.includes('\0') || directory.length > 4096) throw new Error('Elige una carpeta local con ruta absoluta.')
     const path = await realpath(directory).catch(() => { throw new Error('La carpeta no existe o no es accesible.') })
     if (!(await stat(path)).isDirectory()) throw new Error('El proyecto debe ser una carpeta.')
-    const server = application === 'codex' ? '' : localServer(serverURL)
+    const server = application !== 'opencode' ? '' : localServer(serverURL)
     const item = { id: this.id(server, path, application), directory: path, name: basename(path) || path, serverURL: server, application }
     let api
     if (application === 'codex') {
       if (!this.codex) throw new Error('Codex no está habilitado en este puente.')
       await this.codex.verify(path)
+    } else if (application !== 'opencode') {
+      if (!this.native) throw new Error('Este puente necesita actualizarse para abrir esta aplicación.')
+      await this.native.verify(path, application)
     } else {
       const credentials = password === undefined && server === this.serverURL ? this.credentials : { username, password: password || '' }
       api = this.client(server, path, credentials)

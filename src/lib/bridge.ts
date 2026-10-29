@@ -22,6 +22,7 @@ import { captureDiagnostics } from './utterance-audio'
 /** Anything the bridge sends. Deliberately loose — a frame from a future
  *  bridge build should be ignored, not crash the turn. */
 type Frame = {
+  capabilities?: ReturnType<typeof useStore.getState>['applicationCapabilities']
   event?: unknown
   status?: TimingStatus
   requestID?: string
@@ -123,7 +124,7 @@ export async function chooseConversation(id: string = 'new') {
   detachDirectClips()
   pending?.finish(undefined, 'detached')
   destinationRevision++
-  useStore.setState({ autoScreen: false, screenCapture: 'off', recording: null })
+  useStore.setState({ autoScreen: false, screenCapture: 'off', recording: null, applicationCapabilities: null })
   if (socket) recordingVersions.delete(socket)
   conversation = null; publishConversation()
   requestedConversation = id
@@ -149,6 +150,7 @@ export function deleteConversation() {
 
 /** Server names reported by the bridge, for the HUD readout. */
 let servers: string[] = []
+function nativeVoiceName() { const app = selectedProject()?.application || servers.find(value => ['codex','claude','antigravity'].includes(value)) || 'codex'; return ({ codex: 'Codex', claude: 'Claude Code', antigravity: 'Antigravity' } as Record<string, string>)[app] || 'El cliente' }
 export const bridgeServers = () => servers
 
 /** The list arrives twice — once from config, once with live status — so the
@@ -371,6 +373,14 @@ function dispatch(ws: WebSocket) {
       connectionTimings.get(ws)?.end()
       servers = []; firstReady.resolve()
     } else if (msg.type === 'ready') {
+      const caps = msg.capabilities
+      useStore.setState({ applicationCapabilities: caps && typeof caps.screenOptIn === 'boolean' ? {
+        screenOptIn: caps.screenOptIn,
+        ...(typeof caps.archive === 'boolean' ? { archive: caps.archive } : {}),
+        ...(typeof caps.transcriptOnly === 'boolean' ? { transcriptOnly: caps.transcriptOnly } : {}),
+        ...(typeof caps.nativePermissionUI === 'boolean' ? { nativePermissionUI: caps.nativePermissionUI } : {}),
+        ...(typeof caps.historyScope === 'string' ? { historyScope: caps.historyScope } : {}),
+      } : null })
       connectionTimings.get(ws)?.end()
       if (msg.conversation) {
         conversation = msg.conversation
@@ -508,7 +518,7 @@ function connect(): Promise<WebSocket> {
       // session, and the two want different handling.
       settle(new Error('The bridge closed the connection.'))
       if (socket === ws) {
-        useStore.setState({ autoScreen: false, screenCapture: 'off', recording: null })
+        useStore.setState({ autoScreen: false, screenCapture: 'off', recording: null, applicationCapabilities: null })
         policyRequestID = null
         publishPolicy({ mode: 'manual', autoApproved: 0, connected: false, pending: false, error: '' })
         socket = null
@@ -606,9 +616,11 @@ export function ask(
   traceId: string = newTrace(),
   options?: { audioMode?: 'transcript' },
 ): Promise<TurnResult> {
-  const audioMode = options?.audioMode || currentVoiceInputMode()
-  if (selectedProject()?.application === 'codex' && (audio || audioMode !== 'transcript')) {
-    return Promise.reject(new Error('Codex usa solo dictado del navegador. No se envió el clip ni se convirtió su subtítulo en un mensaje.'))
+  const requestedMode = options?.audioMode || currentVoiceInputMode()
+  const audioMode = requestedMode === 'whisper' ? 'transcript' : requestedMode
+  if (requestedMode === 'whisper') audio = undefined
+  if (selectedProject()?.application && selectedProject()?.application !== 'opencode' && (audio || audioMode !== 'transcript')) {
+    return Promise.reject(new Error(nativeVoiceName() + ' recibe solo texto transcrito. No se envió el clip ni se convirtió su subtítulo en un mensaje.'))
   }
   if (audioMode !== 'direct') {
     if (!directClips.size) return askTurn(prompt, handlers, audio, traceId, audioMode)
@@ -625,7 +637,7 @@ export function ask(
   let session = conversation?.id || requestedConversation
   if (!session) { try { session = localStorage.getItem(chatKey()) } catch { /* optional storage */ } }
   let selection: DirectClip['selection']
-  if ((servers.includes('opencode') || servers.includes('codex'))) {
+  if ((['opencode','codex','claude','antigravity'].some(app => servers.includes(app)))) {
     // Invoke now, not when an older clip finally frees the lane. Cached model
     // choice is captured with this utterance rather than a later UI selection.
     try { selection = currentModelSelection().then(value => ({ value }), error => ({ error })) }
@@ -677,7 +689,7 @@ async function askTurn(
   direct?: DirectClip,
 ): Promise<TurnResult> {
   reportVoiceInput(audioMode === 'direct' ? 'Preparando el clip para enviarlo a la aplicación…'
-    : audioMode === 'transcript' ? 'Entrada por transcripción: no se envía audio.' : audio ? 'Preparando tu clip MP3…'
+    : audioMode === 'transcript' ? currentVoiceInputMode() === 'whisper' ? 'Whisper local: enviando solo el texto reconocido.' : 'Entrada por transcripción: no se envía audio.' : audio ? 'Preparando tu clip MP3…'
     : captureDiagnostics().status === 'overflow' ? 'La intervención supera el límite de 60 s: se envía el dictado completo en lugar de un audio recortado.'
       : 'No hay un clip completo verificable; se usa el texto del dictado.')
   /**
@@ -746,7 +758,7 @@ async function askTurn(
       const chosen = await waitDirect(direct.selection, direct)
       if ('error' in chosen) throw chosen.error
       selection = chosen.value
-    } else if ((servers.includes('opencode') || servers.includes('codex'))) selection = await waitDirect(currentModelSelection(), direct)
+    } else if ((['opencode','codex','claude','antigravity'].some(app => servers.includes(app)))) selection = await waitDirect(currentModelSelection(), direct)
     await waitForStop(ws, traceId, direct)
     if (direct && !validDirect(direct)) throw new DirectAbandoned(direct.discardedStatus)
     selectionSpan.end()
@@ -889,11 +901,11 @@ async function askTurn(
     arm()
 
     try {
-      if (useStore.getState().autoScreen === true && recordingVersions.get(ws) !== 1) {
+      if (useStore.getState().autoScreen === true && (recordingVersions.get(ws) !== 1 || useStore.getState().applicationCapabilities?.screenOptIn !== true)) {
         throw new Error('Reinicia el puente y vuelve a activar Compartir pantalla. No se envió la pregunta sin su captura solicitada.')
       }
-      if (servers.includes('codex') && (audio || audioMode !== 'transcript')) {
-        throw new Error('Codex usa solo dictado del navegador. No se envió el clip ni su subtítulo.')
+      if (['codex','claude','antigravity'].some(app => servers.includes(app)) && (audio || audioMode !== 'transcript')) {
+        throw new Error(nativeVoiceName() + ' recibe solo texto transcrito. No se envió el clip ni se convirtió su subtítulo en un mensaje.')
       }
       if (direct) {
         if (!validDirect(direct) || socket !== ws) { finish('', 'detached'); return }
@@ -969,7 +981,7 @@ subscribeProjects(() => {
   detachDirectClips()
   pending?.finish(undefined, 'detached')
   requestedConversation = null; conversation = null; publishConversation()
-  useStore.setState({ turns: [], caption: '', permissions: [], screenCapture: 'off', autoScreen: false, recording: null })
+  useStore.setState({ turns: [], caption: '', permissions: [], screenCapture: 'off', autoScreen: false, recording: null, applicationCapabilities: null })
   if (socket) recordingVersions.delete(socket)
   manualSwitch = true
   connectionEpoch++; connecting = null
