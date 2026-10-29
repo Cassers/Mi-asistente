@@ -15,7 +15,7 @@ const byClass = (tree, name) => nodes(tree).find(node => node.props?.className?.
 const button = (tree, label) => nodes(tree).find(node => node.type === 'button' && text(node).includes(label))
 
 // Actual UI, fake store/bridge and inert effects. Never opens devices or sockets.
-export function fixture(patch = {}, configured = true, application = 'opencode') {
+export function fixture(patch = {}, configured = true, application = 'opencode', voice = { mode: 'transcript', status: '' }) {
   const events = [], slots = []
   let cursor = 0, historyResult = Promise.resolve()
   const state = { phase: 'dormant', microphoneActive: true, microphoneMuted: false, microphoneBusy: false,
@@ -36,7 +36,7 @@ export function fixture(patch = {}, configured = true, application = 'opencode')
     '../lib/profile': { useProfile: () => ({ name: 'Demo', configured }), displayName: () => 'Demo', wakeWord: () => 'Demo' },
     '../lib/whisper': { useWhisperCapabilities: () => ({ state: 'unavailable', capabilities: null, error: 'Whisper no configurado en este fixture.' }),
       refreshWhisper: async () => { throw Error('fixture unavailable') }, subscribeWhisperInvalidation: () => () => {}, whisperAccept: () => '', transcribeWhisper: () => assert.fail('fixture must never transcribe') },
-    '../lib/voice-input-mode': { useVoiceInputMode: () => 'transcript', useVoiceInputStatus: () => '' },
+    '../lib/voice-input-mode': { useVoiceInputMode: () => voice.mode, useVoiceInputStatus: () => voice.status },
     '../lib/projects': { useProjects: () => ({ selected: { application } }) },
     '../lib/brain': { setRecordingActive: enabled => { events.push(['history', enabled]); return historyResult } },
     'framer-motion': { AnimatePresence: ({ children }) => children, motion: { div: ({ children }) => React.createElement('div', null, children) } },
@@ -155,3 +155,15 @@ test('history pending/error confirmation preserves scope and never toggles shari
   assert.equal(button(tree, 'Reanudar').props.disabled, false)
   assert.deepEqual(f.events, [['history', true], ['error', 'Synthetic confirmation failed']])
 })
+
+test('voice panel identifies selected input and exposes direct wake failure without changing capture', () => {
+  for (const [mode, label] of [['direct', 'Audio directo'], ['transcript', 'Transcripción del navegador'], ['whisper', 'Whisper local']]) {
+    const status = mode === 'direct' ? 'Audio directo activo sin dictado visual. Puedes activar la escucha con Espacio.' : 'Aviso del motor seleccionado';
+    const f = fixture({}, true, 'opencode', { mode, status });
+    const html = f.html();
+    assert.ok(html.includes('Entrada seleccionada: ' + label));
+    assert.ok(html.includes(status), mode + ' must expose its actual driver status');
+    if (mode === 'direct') assert.match(html, /La activación por nombre depende del reconocimiento del navegador/);
+    assert.deepEqual(f.events, [], 'showing the input status cannot start devices, change input or resume history');
+  }
+});

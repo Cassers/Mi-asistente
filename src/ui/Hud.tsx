@@ -255,7 +255,9 @@ export function Hud({ onPause, onResume, onToggleMicrophone, onToggleStandby, on
                 inactive={microphoneAvailability === 'off'}
                 standby={microphoneStandby} name={wakeWord(profile)} onStandby={onToggleStandby}
                 historyActive={recording?.active === true} historyMicrophone={recording?.audio?.includes('mic') !== false} onToggle={onToggleMicrophone} />
-              {inputMode === 'whisper' && voiceInputStatus && <p className="control-help" role="status" aria-live="polite">{voiceInputStatus}</p>}
+              <p className="control-help">Entrada seleccionada: {inputMode === 'direct' ? 'Audio directo' : inputMode === 'whisper' ? 'Whisper local' : 'Transcripción del navegador'}.</p>
+              {inputMode === 'direct' && <p className="control-help">La activación por nombre depende del reconocimiento del navegador. Si falla, pulsa Espacio o elige otro motor en Configuración → Voz y permisos.</p>}
+              {voiceInputStatus && <p className="control-help" role="status" aria-live="polite">{voiceInputStatus}</p>}
               <ListeningControl paused={conversationPaused} muted={microphoneMuted || !microphoneActive} standby={microphoneStandby}
                 disabled={phase === 'offline' || phase === 'boot' || microphoneMuted && conversationPaused}
                 name={wakeWord(profile)} onPause={onPause} onResume={onResume} />
